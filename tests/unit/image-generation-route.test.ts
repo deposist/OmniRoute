@@ -15,6 +15,7 @@ const settingsDb = await import("../../src/lib/db/settings.ts");
 const imageRoute = await import("../../src/app/api/v1/images/generations/route.ts");
 const imageEditRoute = await import("../../src/app/api/v1/images/edits/route.ts");
 const v1ModelsCatalog = await import("../../src/app/api/v1/models/catalog.ts");
+const pluginImageProviders = await import("../../src/lib/plugins/imageProviders.ts");
 
 const originalFetch = globalThis.fetch;
 
@@ -30,6 +31,7 @@ async function resetStorage() {
   // running within the TTL window of a previous one gets served the previous test's
   // stale serialized catalog instead of a fresh build reflecting this test's DB state.
   v1ModelsCatalog.__resetCatalogBuilderRunsForTest();
+  pluginImageProviders.resetPluginImageProviders();
 }
 
 async function seedConnection(provider: string, overrides: { apiKey?: string | null } = {}) {
@@ -84,6 +86,27 @@ test("v1 image models GET exposes current Codex image models and hides inactive 
   assert.ok(!ids.includes("codex/gpt-5.5"));
   assert.ok(!ids.includes("openai/gpt-image-2"));
   assert.ok(!ids.some((id: string) => id.startsWith("xai/")));
+});
+
+test("v1 image models GET exposes plugin models through their credential provider", async () => {
+  await seedConnection("chatgpt-web", { apiKey: "session-cookie" });
+  pluginImageProviders.registerPluginImageProvider({
+    id: "chatgpt-web-images",
+    alias: "cgpt-web-plugin",
+    pluginName: "chatgpt-web-images",
+    credentialProvider: "chatgpt-web",
+    models: [{ id: "gpt-5.5", name: "GPT Image", inputModalities: ["text", "image"] }],
+    supportedSizes: ["1024x1024"],
+    operations: ["generation", "edit"],
+    timeoutMs: 1200000,
+    generate: async () => ({ status: 200, data: [{ b64_json: "AA==" }] }),
+  });
+
+  const response = await imageRoute.GET();
+  const body = (await response.json()) as { data: Array<{ id: string }> };
+
+  assert.equal(response.status, 200);
+  assert.ok(body.data.some((item) => item.id === "chatgpt-web-images/gpt-5.5"));
 });
 
 test("v1 image generation POST accepts promptless requests for image-only models", async () => {
