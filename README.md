@@ -642,6 +642,47 @@ Use these only for clients that cannot attach `Authorization: Bearer ...`. Heade
 
 <br/>
 
+## ChatGPT Web images plugin — OmniRoute 3.8.48
+
+This external plugin adds ChatGPT Web image generation and multi-image editing without modifying the built-in ChatGPT Web executor. Requirements: **Linux x64**, **OmniRoute 3.8.48**, Node.js `>=22.19 <23` or `>=24 <27`, and an active **ChatGPT Web** provider connection.
+
+### Install
+
+Run as a user with `sudo` access:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fL -o /tmp/omniroute-image-plugin-r5-install.sh https://github.com/deposist/OmniRoute/releases/download/v3.8.48-image-plugin-r5/omniroute-image-plugin-r5-install.sh && echo '515005ff06080d413149de45759740a226d7d598a7e65dbd8b2a16be8e1ced87  /tmp/omniroute-image-plugin-r5-install.sh' | sha256sum -c - && sudo bash /tmp/omniroute-image-plugin-r5-install.sh install
+```
+
+The installer verifies both release archives, activates the plugin, restarts OmniRoute, confirms model persistence, and records a rollback backup. It does not expose or copy the ChatGPT session cookie.
+
+### Configure Open WebUI
+
+Use this exact model ID for both generation and editing — **`images` is plural**:
+
+```env
+ENABLE_IMAGE_GENERATION=true
+IMAGE_GENERATION_ENGINE=openai
+IMAGE_GENERATION_MODEL=chatgpt-web-images/gpt-5.5
+IMAGES_OPENAI_API_BASE_URL=http://YOUR_OMNIROUTE_HOST:20128/v1
+IMAGES_OPENAI_API_KEY=YOUR_OMNIROUTE_API_KEY
+IMAGE_SIZE=1024x1024
+
+ENABLE_IMAGE_EDIT=true
+IMAGE_EDIT_ENGINE=openai
+IMAGE_EDIT_MODEL=chatgpt-web-images/gpt-5.5
+IMAGES_EDIT_OPENAI_API_BASE_URL=http://YOUR_OMNIROUTE_HOST:20128/v1
+IMAGES_EDIT_OPENAI_API_KEY=YOUR_OMNIROUTE_API_KEY
+```
+
+Do **not** use `chatgpt-web-image/gpt-5.5` (singular) or the retired `cgpt-web/gpt-image-2` alias. A `Sentinel/Turnstile required` response means the ChatGPT browser session must be refreshed; update the `__Secure-next-auth.session-token` value in the ChatGPT Web provider connection.
+
+### Roll back
+
+```bash
+sudo bash /tmp/omniroute-image-plugin-r5-install.sh rollback
+```
+
 ## 📦 More install methods — Docker, source, pnpm, Arch
 
 **🐳 Docker**
