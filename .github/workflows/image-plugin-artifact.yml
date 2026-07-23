@@ -1,0 +1,122 @@
+name: Build Image Plugin Artifact
+
+on:
+  push:
+    branches:
+      - image-plugin-abi-3.8.48
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-plugin-artifact-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "24"
+  ARTIFACT_DIR: release-assets/image-plugin-3.8.48-linux-x64
+
+jobs:
+  build:
+    name: Build and verify Linux x64 package
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install OmniRoute dependencies
+        uses: ./.github/actions/npm-ci-retry
+
+      - name: Typecheck
+        run: npm run typecheck:core
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test image-provider ABI
+        env:
+          DISABLE_SQLITE_AUTO_BACKUP: "true"
+        run: |
+          node --import tsx/esm --test --test-force-exit \
+            tests/unit/chatgpt-web.test.ts \
+            tests/unit/image-generation-route.test.ts \
+            tests/unit/image-edits-multipart-3273.test.ts \
+            tests/unit/image-routes-combo-edits-3214-3215.test.ts \
+            tests/unit/plugins-manifest.test.ts \
+            tests/unit/plugins-image-providers.test.ts \
+            tests/unit/plugins-loader-ipc.test.ts
+
+      - name: Install and test autonomous image plugin
+        working-directory: examples/plugins/chatgpt-web-images
+        run: |
+          npm ci --omit=dev
+          node --input-type=module -e "await import('tls-client-node')"
+          test -d node_modules/tls-client-node/bin
+          test -n "$(find node_modules/tls-client-node/bin -type f -print -quit)"
+          node --test tests/plugin.test.mjs
+
+      - name: Build OmniRoute standalone runtime
+        env:
+          OMNIROUTE_USE_TURBOPACK: "1"
+          JWT_SECRET: ci-build-secret-with-sufficient-length-for-validation
+        run: npm run build
+
+      - name: Assemble npm runtime
+        env:
+          JWT_SECRET: ci-build-secret-with-sufficient-length-for-validation
+        run: npm run build:cli
+
+      - name: Validate npm package artifact
+        run: npm run check:pack-artifact
+
+      - name: Pack installable artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_DIR"
+
+          npm pack --ignore-scripts --pack-destination "$ARTIFACT_DIR"
+          package_tgz="$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name 'omniroute-*.tgz' -print -quit)"
+          test -n "$package_tgz"
+          mv "$package_tgz" "$ARTIFACT_DIR/omniroute-3.8.48-image-plugin-linux-x64.tgz"
+
+          tar -czf "$ARTIFACT_DIR/chatgpt-web-images-linux-x64.tgz" \
+            -C examples/plugins chatgpt-web-images
+
+          tar -tzf "$ARTIFACT_DIR/omniroute-3.8.48-image-plugin-linux-x64.tgz" \
+            > "$ARTIFACT_DIR/omniroute-contents.txt"
+          grep -Fx 'package/dist/server.js' "$ARTIFACT_DIR/omniroute-contents.txt"
+          grep -Fx 'package/src/lib/plugins/imageProviders.ts' "$ARTIFACT_DIR/omniroute-contents.txt"
+
+          tar -tzf "$ARTIFACT_DIR/chatgpt-web-images-linux-x64.tgz" \
+            > "$ARTIFACT_DIR/plugin-contents.txt"
+          grep -Fx 'chatgpt-web-images/index.mjs' "$ARTIFACT_DIR/plugin-contents.txt"
+          grep -Fx 'chatgpt-web-images/plugin.json' "$ARTIFACT_DIR/plugin-contents.txt"
+          grep -Fx 'chatgpt-web-images/node_modules/tls-client-node/index.mjs' \
+            "$ARTIFACT_DIR/plugin-contents.txt"
+
+          (
+            cd "$ARTIFACT_DIR"
+            sha256sum \
+              omniroute-3.8.48-image-plugin-linux-x64.tgz \
+              chatgpt-web-images-linux-x64.tgz \
+              > SHA256SUMS
+          )
+
+      - name: Upload installable Linux artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: omniroute-3.8.48-image-plugin-linux-x64
+          path: release-assets/image-plugin-3.8.48-linux-x64/
+          if-no-files-found: error
+          retention-days: 30

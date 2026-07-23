@@ -1,5 +1,6 @@
 import {
   handleImageEdit,
+  handlePluginImageEdit,
   handleOpenAIImageEdit,
 } from "@omniroute/open-sse/handlers/imageGeneration.ts";
 import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
@@ -18,6 +19,8 @@ import {
   extractImageEditInputFromJson,
 } from "@/lib/images/imageRouteModel";
 import { z } from "zod";
+import { resolveProxyForConnection } from "@/lib/localDb";
+import { proxyConfigToUrl } from "@omniroute/open-sse/utils/proxyDispatcher.ts";
 
 // JSON edit body (Open WebUI / OpenAI-style). All fields optional — the prompt
 // and resolvable image are enforced after extraction in POST — but the top-level
@@ -81,6 +84,7 @@ interface EditInput {
   responseFormat: string | null;
   imageBytes: Buffer | null;
   imageMime: string | null;
+  imageInputs: Array<{ bytes: Buffer; mime?: string }>;
 }
 
 async function readMultipartImage(formData: FormData): Promise<EditInput> {
@@ -96,14 +100,26 @@ async function readMultipartImage(formData: FormData): Promise<EditInput> {
   // OpenAI's API and Open WebUI both accept either a single `image` field or
   // an `image[]` array. We use the first image when multiple are sent — the
   // chatgpt-web edit tool can only edit one image per conversation node.
-  const imageEntry = formData.get("image") ?? formData.get("image[]");
-  if (!imageEntry || typeof imageEntry === "string") {
-    return { prompt, model, size, responseFormat, imageBytes: null, imageMime: null };
+  const imageInputs: Array<{ bytes: Buffer; mime?: string }> = [];
+  const entries = [...formData.getAll("image"), ...formData.getAll("image[]")];
+  for (const imageEntry of entries.slice(0, 4)) {
+    if (!imageEntry || typeof imageEntry === "string") continue;
+    const file = imageEntry as File;
+    imageInputs.push({
+      bytes: Buffer.from(await file.arrayBuffer()),
+      mime: file.type || "image/png",
+    });
   }
-  const file = imageEntry as File;
-  const imageBytes = Buffer.from(await file.arrayBuffer());
-  const imageMime = file.type || "image/png";
-  return { prompt, model, size, responseFormat, imageBytes, imageMime };
+  const first = imageInputs[0];
+  return {
+    prompt,
+    model,
+    size,
+    responseFormat,
+    imageBytes: first?.bytes ?? null,
+    imageMime: first?.mime ?? null,
+    imageInputs,
+  };
 }
 
 /** Read the edit input from either multipart/form-data or a JSON/data-URL body. */
@@ -149,7 +165,7 @@ async function postHandler(request: Request, context) {
     );
   }
 
-  const { prompt, model, size, responseFormat, imageBytes, imageMime } = input;
+  const { prompt, model, size, responseFormat, imageBytes, imageMime, imageInputs } = input;
   if (!prompt) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: prompt");
   }
@@ -172,6 +188,49 @@ async function postHandler(request: Request, context) {
   const resolvedModel = await resolveImageRouteModel(fullModel);
   const parsed = parseImageModel(resolvedModel);
   const providerConfig = parsed.provider ? getImageProvider(parsed.provider) : null;
+
+  if (providerConfig?.format === "plugin") {
+    const credentials = await getProviderCredentialsWithQuotaPreflight(
+      providerConfig.credentialProvider,
+      null,
+      allowedConnections,
+      resolvedModel
+    );
+    if (!credentials) {
+      return errorResponse(
+        HTTP_STATUS.UNAUTHORIZED,
+        `No credentials for provider: ${providerConfig.credentialProvider}`
+      );
+    }
+    if (credentials.allRateLimited) {
+      return unavailableResponse(
+        HTTP_STATUS.RATE_LIMITED,
+        `[${parsed.provider}] All accounts rate limited`,
+        credentials.retryAfter,
+        credentials.retryAfterHuman
+      );
+    }
+    const proxyInfo = credentials.connectionId
+      ? await resolveProxyForConnection(credentials.connectionId).catch(() => null)
+      : null;
+    const result = await handlePluginImageEdit({
+      provider: parsed.provider,
+      model: parsed.model,
+      body: { prompt, size: size ?? undefined },
+      imageInputs,
+      credentials,
+      clientHeaders: publicBaseUrlHeaders(request.headers),
+      proxyUrl: proxyConfigToUrl(proxyInfo?.proxy || null),
+    });
+    if (result.success) {
+      await clearRecoveredProviderState(credentials);
+      return jsonResponse(result.data);
+    }
+    return jsonResponse(
+      toJsonErrorPayload(result.error, "Image edit provider error"),
+      result.status
+    );
+  }
 
   // chatgpt-web keeps its conversation-continuation edit flow unchanged.
   if (providerConfig?.format === "chatgpt-web") {

@@ -104,6 +104,7 @@ interface ParsedImageEditInput {
   responseFormat: string | null;
   imageBytes: Buffer | null;
   imageMime: string | null;
+  imageInputs: Array<{ bytes: Buffer; mime?: string }>;
 }
 
 /** Parse a `data:<mime>;base64,<data>` URL into raw bytes + mime, or null when invalid. */
@@ -153,16 +154,21 @@ export function extractImageEditInputFromJson(body: unknown): ParsedImageEditInp
     }
   }
 
-  let imageBytes: Buffer | null = null;
-  let imageMime: string | null = null;
+  const imageInputs: Array<{ bytes: Buffer; mime?: string }> = [];
   for (const candidate of candidates) {
     const parsed = parseDataUrl(candidate);
-    if (parsed) {
-      imageBytes = parsed.bytes;
-      imageMime = parsed.mime;
-      break;
-    }
+    if (parsed) imageInputs.push(parsed);
+    if (imageInputs.length >= 4) break;
   }
 
-  return { prompt, model, size, responseFormat, imageBytes, imageMime };
+  const first = imageInputs[0];
+  return {
+    prompt,
+    model,
+    size,
+    responseFormat,
+    imageBytes: first?.bytes ?? null,
+    imageMime: first?.mime ?? null,
+    imageInputs,
+  };
 }

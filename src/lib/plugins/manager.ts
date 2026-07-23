@@ -25,6 +25,10 @@ import {
   type PluginRow,
 } from "../db/plugins";
 import type { PluginManifestWithDefaults } from "./manifest";
+import {
+  registerPluginImageProvider,
+  unregisterPluginImageProviders,
+} from "./imageProviders";
 
 const log = logger("PLUGIN_MANAGER");
 
@@ -33,6 +37,8 @@ type LifecycleHookName = Extract<
   | "onRequest"
   | "onResponse"
   | "onError"
+  | "onImageGeneration"
+  | "onImageEdit"
   | "onInstall"
   | "onActivate"
   | "onDeactivate"
@@ -218,6 +224,8 @@ class PluginManager {
         manifest.hooks.onRequest && "onRequest",
         manifest.hooks.onResponse && "onResponse",
         manifest.hooks.onError && "onError",
+        manifest.hooks.onImageGeneration && "onImageGeneration",
+        manifest.hooks.onImageEdit && "onImageEdit",
         manifest.hooks.onInstall && "onInstall",
         manifest.hooks.onActivate && "onActivate",
         manifest.hooks.onDeactivate && "onDeactivate",
@@ -373,7 +381,7 @@ class PluginManager {
   async activate(name: string): Promise<void> {
     const row = getPluginByName(name);
     if (!row) throw new Error(`Plugin '${name}' not found`);
-    if (row.status === "active") return;
+    if (row.status === "active" && this.loadedPlugins.has(name)) return;
 
     const manifest = JSON.parse(row.manifest) as PluginManifestWithDefaults;
 
@@ -393,13 +401,16 @@ class PluginManager {
       throw new Error(`Plugin '${name}' entry point escapes plugin directory`);
     }
 
+    let loaded: LoadedPlugin | null = null;
     try {
-      const loaded = await loadPlugin(entryPoint, manifest);
+      loaded = await loadPlugin(entryPoint, manifest, JSON.parse(row.config || "{}"));
 
       const hookNames: LifecycleHookName[] = [
         "onRequest",
         "onResponse",
         "onError",
+        "onImageGeneration",
+        "onImageEdit",
         "onInstall",
         "onActivate",
         "onDeactivate",
@@ -412,6 +423,17 @@ class PluginManager {
         }
       }
 
+      for (const provider of manifest.imageProviders) {
+        registerPluginImageProvider({
+          ...provider,
+          pluginName: name,
+          generate: provider.operations.includes("generation")
+            ? loaded.plugin.onImageGeneration
+            : undefined,
+          edit: provider.operations.includes("edit") ? loaded.plugin.onImageEdit : undefined,
+        });
+      }
+
       this.loadedPlugins.set(name, loaded);
       updatePluginStatus(name, "active");
 
@@ -422,6 +444,10 @@ class PluginManager {
 
       log.info("manager.activated", { name });
     } catch (err: any) {
+      unregisterPluginImageProviders(name);
+      unregisterHooks(name);
+      loaded?.cleanup();
+      this.loadedPlugins.delete(name);
       updatePluginStatus(name, "error", err.message);
       log.error("manager.activate_failed", { name, error: err.message });
       throw err;
@@ -445,9 +471,10 @@ class PluginManager {
       await emitHook("onDeactivate", { name, version: manifest.version, manifest });
     }
 
+    unregisterPluginImageProviders(name);
+    unregisterHooks(name);
     const loaded = this.loadedPlugins.get(name);
     if (loaded) {
-      unregisterHooks(name);
       loaded.cleanup();
       this.loadedPlugins.delete(name);
     }
@@ -520,6 +547,8 @@ class PluginManager {
               discovered.manifest.hooks.onRequest && "onRequest",
               discovered.manifest.hooks.onResponse && "onResponse",
               discovered.manifest.hooks.onError && "onError",
+              discovered.manifest.hooks.onImageGeneration && "onImageGeneration",
+              discovered.manifest.hooks.onImageEdit && "onImageEdit",
               discovered.manifest.hooks.onInstall && "onInstall",
               discovered.manifest.hooks.onActivate && "onActivate",
               discovered.manifest.hooks.onDeactivate && "onDeactivate",

@@ -43,6 +43,10 @@ import {
 import { fetchRemoteImage } from "@/shared/network/remoteImageFetch";
 import { FetchTimeoutError, fetchWithTimeout, getConfiguredTimeout } from "@/shared/utils/fetchTimeout";
 import { sanitizeErrorMessage, sanitizeUpstreamDetails } from "../utils/error.ts";
+import {
+  getPluginImageProvider,
+  normalizePluginImageResult,
+} from "@/lib/plugins/imageProviders";
 
 // --- Per-provider handlers (extracted to co-located files in PR-#4582-batch) ---
 // Imported locally so internal callers (handleImageGeneration / handleImageEdit)
@@ -285,6 +289,7 @@ export async function handleImageGeneration({
   resolvedProvider = null,
   signal = null,
   clientHeaders = null,
+  pluginProxyUrl = null,
 }) {
   let provider, model;
 
@@ -310,6 +315,34 @@ export async function handleImageGeneration({
   }
 
   const providerConfig = getImageProvider(provider);
+
+  if (providerConfig?.format === "plugin") {
+    const pluginProvider = getPluginImageProvider(provider);
+    if (!pluginProvider?.generate) {
+      return {
+        success: false,
+        status: 400,
+        error: `Image generation is not supported by plugin provider: ${provider}`,
+      };
+    }
+    try {
+      return pluginImageResultToHandlerResult(
+        normalizePluginImageResult(await pluginProvider.generate({
+        operation: "generation",
+        provider,
+        model,
+        body,
+        images: [],
+        credentials: pluginCredentials(credentials),
+        clientHeaders: clientHeaders || {},
+        proxyUrl: pluginProxyUrl,
+        config: {},
+        }))
+      );
+    } catch (error) {
+      return pluginExecutionError(error);
+    }
+  }
 
   // For custom models without a built-in provider config, use OpenAI-compatible handler
   // with a synthetic config based on the provider's credentials
@@ -536,6 +569,93 @@ export async function handleImageGeneration({
   }
 
   return handleOpenAIImageGeneration({ model, provider, providerConfig, body, credentials, log });
+}
+
+function pluginImageResultToHandlerResult(result: ReturnType<typeof normalizePluginImageResult>) {
+  if (!result.success) return result;
+  return {
+    success: true,
+    data: {
+      created: Math.floor(Date.now() / 1000),
+      data: result.images.map((image) => ({ b64_json: image.base64 })),
+    },
+  };
+}
+
+function pluginExecutionError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    success: false as const,
+    status: /timed out/i.test(message) ? 504 : 502,
+    error: `Image plugin execution failed: ${message}`,
+  };
+}
+
+function pluginCredentials(credentials: Record<string, unknown> | null) {
+  if (!credentials) return null;
+  const allowed = [
+    "apiKey",
+    "accessToken",
+    "refreshToken",
+    "expiresAt",
+    "connectionId",
+    "providerSpecificData",
+  ];
+  return Object.fromEntries(allowed.flatMap((key) => (key in credentials ? [[key, credentials[key]]] : [])));
+}
+
+export async function handlePluginImageEdit({
+  provider,
+  model,
+  body,
+  imageInputs,
+  credentials,
+  clientHeaders = null,
+  proxyUrl = null,
+}: {
+  provider: string;
+  model: string;
+  body: Record<string, unknown>;
+  imageInputs: Array<{ bytes: Buffer; mime?: string }>;
+  credentials: Record<string, unknown> | null;
+  clientHeaders?: Record<string, string> | null;
+  proxyUrl?: string | null;
+}) {
+  const pluginProvider = getPluginImageProvider(provider);
+  if (!pluginProvider?.edit) {
+    return {
+      success: false as const,
+      status: 400,
+      error: `Image edit is not supported by plugin provider: ${provider}`,
+    };
+  }
+  let result;
+  try {
+    result = normalizePluginImageResult(await pluginProvider.edit({
+        operation: "edit",
+        provider,
+        model,
+        body,
+        images: imageInputs.slice(0, 4).map((image) => ({
+          base64: image.bytes.toString("base64"),
+          mime: image.mime || "image/png",
+        })),
+        credentials: pluginCredentials(credentials),
+        clientHeaders: clientHeaders || {},
+        proxyUrl,
+        config: {},
+      }));
+  } catch (error) {
+    return pluginExecutionError(error);
+  }
+  if (!result.success) return result;
+  return {
+    success: true as const,
+    data: {
+      created: Math.floor(Date.now() / 1000),
+      data: result.images.map((image) => ({ b64_json: image.base64 })),
+    },
+  };
 }
 
 function normalizeKieImageResult(recordData: unknown): string[] {

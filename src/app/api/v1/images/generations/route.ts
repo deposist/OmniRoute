@@ -22,6 +22,7 @@ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { getAllCustomModels, resolveProxyForConnection } from "@/lib/localDb";
 import { resolveImageRouteModel } from "@/lib/images/imageRouteModel";
 import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
+import { proxyConfigToUrl } from "@omniroute/open-sse/utils/proxyDispatcher.ts";
 import { attachOmniRouteMetaHeaders } from "@/domain/omnirouteResponseMeta";
 import { calculateModalCost } from "@/lib/usage/costCalculator";
 import { generateRequestId } from "@/shared/utils/requestId";
@@ -171,7 +172,9 @@ async function postHandler(request, context) {
   // Get credentials — skip for local providers (authType: "none")
   let credentials = null;
   if (providerConfig && providerConfig.authType !== "none") {
-    credentials = await getProviderCredentialsWithQuotaPreflight(provider);
+    credentials = await getProviderCredentialsWithQuotaPreflight(
+      providerConfig.format === "plugin" ? providerConfig.credentialProvider : provider
+    );
     if (!credentials) {
       return errorResponse(
         HTTP_STATUS.BAD_REQUEST,
@@ -222,6 +225,7 @@ async function postHandler(request, context) {
       ...(isCustomModel && { resolvedProvider: provider }),
       signal: request.signal,
       clientHeaders: publicBaseUrlHeaders(request.headers),
+      pluginProxyUrl: proxyConfigToUrl(proxyInfo?.proxy || null),
     });
 
   // Execute with proxy context when available, direct otherwise (#1904)

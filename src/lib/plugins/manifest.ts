@@ -39,11 +39,33 @@ export const HooksSchema = z.object({
   onRequest: z.boolean().optional(),
   onResponse: z.boolean().optional(),
   onError: z.boolean().optional(),
+  onImageGeneration: z.boolean().optional(),
+  onImageEdit: z.boolean().optional(),
   onInstall: z.boolean().optional(),
   onActivate: z.boolean().optional(),
   onDeactivate: z.boolean().optional(),
   onUninstall: z.boolean().optional(),
 });
+
+// ── Image provider definitions ──
+
+export const ImageProviderModelSchema = z.object({
+  id: z.string().min(1).max(200),
+  name: z.string().min(1).max(200),
+  inputModalities: z.array(z.enum(["text", "image"])).min(1).default(["text"]),
+  description: z.string().max(500).optional(),
+});
+
+export const ImageProviderSchema = z.object({
+  id: z.string().min(1).max(100).regex(/^[a-z0-9-]+$/),
+  alias: z.string().min(1).max(100).regex(/^[a-z0-9-]+$/).optional(),
+  credentialProvider: z.string().min(1).max(100),
+  models: z.array(ImageProviderModelSchema).min(1),
+  supportedSizes: z.array(z.string().min(1).max(40)).default([]),
+  operations: z.array(z.enum(["generation", "edit"])).min(1),
+  timeoutMs: z.number().int().min(1_000).max(30 * 60_000).default(180_000),
+});
+export type ManifestImageProvider = z.infer<typeof ImageProviderSchema>;
 
 // ── Requires ──
 
@@ -69,6 +91,7 @@ export const PluginManifestSchema = z.object({
   tags: z.array(z.string()).optional(),
   requires: RequiresSchema.optional(),
   hooks: HooksSchema.optional(),
+  imageProviders: z.array(ImageProviderSchema).optional(),
   skills: z.array(ManifestSkillSchema).optional(),
   enabledByDefault: z.boolean().optional(),
   configSchema: z.record(z.string(), ConfigFieldSchema).optional(),
@@ -85,6 +108,26 @@ export const PluginManifestSchema = z.object({
    *   console.log('sha256-'+createHash('sha256').update(readFileSync('index.js')).digest('base64'))"`
    */
   integrity: z.string().optional(),
+}).superRefine((manifest, ctx) => {
+  const providers = manifest.imageProviders ?? [];
+  const needsGeneration = providers.some((provider) =>
+    provider.operations.includes("generation")
+  );
+  const needsEdit = providers.some((provider) => provider.operations.includes("edit"));
+  if (needsGeneration && manifest.hooks?.onImageGeneration !== true) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["hooks", "onImageGeneration"],
+      message: "Image provider generation requires hooks.onImageGeneration=true",
+    });
+  }
+  if (needsEdit && manifest.hooks?.onImageEdit !== true) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["hooks", "onImageEdit"],
+      message: "Image provider edit requires hooks.onImageEdit=true",
+    });
+  }
 });
 
 export type PluginManifest = z.infer<typeof PluginManifestSchema>;
@@ -101,11 +144,14 @@ export interface PluginManifestWithDefaults extends PluginManifest {
     onRequest: boolean;
     onResponse: boolean;
     onError: boolean;
+    onImageGeneration: boolean;
+    onImageEdit: boolean;
     onInstall: boolean;
     onActivate: boolean;
     onDeactivate: boolean;
     onUninstall: boolean;
   };
+  imageProviders: ManifestImageProvider[];
   skills: ManifestSkill[];
   enabledByDefault: boolean;
   configSchema: Record<string, ConfigField>;
@@ -126,11 +172,14 @@ export function applyDefaults(manifest: PluginManifest): PluginManifestWithDefau
       onRequest: manifest.hooks?.onRequest ?? false,
       onResponse: manifest.hooks?.onResponse ?? false,
       onError: manifest.hooks?.onError ?? false,
+      onImageGeneration: manifest.hooks?.onImageGeneration ?? false,
+      onImageEdit: manifest.hooks?.onImageEdit ?? false,
       onInstall: manifest.hooks?.onInstall ?? false,
       onActivate: manifest.hooks?.onActivate ?? false,
       onDeactivate: manifest.hooks?.onDeactivate ?? false,
       onUninstall: manifest.hooks?.onUninstall ?? false,
     },
+    imageProviders: manifest.imageProviders ?? [],
     skills: manifest.skills ?? [],
     enabledByDefault: manifest.enabledByDefault ?? false,
     configSchema: manifest.configSchema ?? {},

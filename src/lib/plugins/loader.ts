@@ -8,14 +8,16 @@
  * @module plugins/loader
  */
 
-import { spawn } from "child_process";
+import { fork } from "child_process";
 import { writeFile, rm, readFile } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import { randomUUID, createHash } from "crypto";
+import { pathToFileURL } from "url";
 import { logger } from "../../../open-sse/utils/logger.ts";
 import type { PluginManifestWithDefaults, Permission } from "./manifest";
 import type { Plugin, PluginContext, PluginResult } from "./index";
+import type { PluginImageRequestContext, PluginImageResult } from "./imageProviders";
 
 const log = logger("PLUGIN_LOADER");
 
@@ -46,7 +48,14 @@ const PLUGIN_HOST_SCRIPT = `
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 
-const pluginPath = process.argv[2];
+const pluginPath = process.env.PLUGIN_ENTRY;
+const pluginConfigSchema = JSON.parse(process.env.PLUGIN_CONFIG_SCHEMA || "{}");
+const storedPluginConfig = JSON.parse(process.env.PLUGIN_CONFIG || "{}");
+const pluginConfig = { ...Object.fromEntries(Object.entries(pluginConfigSchema).flatMap(([key, field]) =>
+  field && typeof field === "object" && Object.prototype.hasOwnProperty.call(field, "default")
+    ? [[key, field.default]]
+    : []
+)), ...storedPluginConfig };
 const plugin = await import(pluginPath);
 const exports = plugin.default || plugin;
 
@@ -62,10 +71,13 @@ process.on("message", async (msg) => {
         process.send({ type: "result", id: msg.id, error: "Hook not found" });
         return;
       }
-      const result = await handler(msg.payload);
+      const payload = msg.payload && typeof msg.payload === "object"
+        ? { ...msg.payload, config: pluginConfig }
+        : msg.payload;
+      const result = await handler(payload);
       process.send({ type: "result", id: msg.id, result });
     } catch (err) {
-      process.send({ type: "result", id: msg.id, error: err.message });
+      process.send({ type: "result", id: msg.id, error: err instanceof Error ? err.message : String(err) });
     }
   }
 });
@@ -77,7 +89,8 @@ process.on("message", async (msg) => {
  */
 export async function loadPlugin(
   entryPoint: string,
-  manifest: PluginManifestWithDefaults
+  manifest: PluginManifestWithDefaults,
+  config: Record<string, unknown> = {}
 ): Promise<LoadedPlugin> {
   // Integrity check: if the manifest declares an integrity field, verify the entry point.
   // Missing integrity is OK for backward compatibility; mismatched integrity is a fatal error.
@@ -128,13 +141,20 @@ export async function loadPlugin(
 
   const env: Record<string, string> = {
     ...getFilteredEnv(permissions),
-    PLUGIN_ENTRY: entryPoint,
+    PLUGIN_ENTRY: pathToFileURL(entryPoint).href,
     PLUGIN_NAME: manifest.name,
+    PLUGIN_CONFIG: JSON.stringify(config),
+    PLUGIN_CONFIG_SCHEMA: JSON.stringify(manifest.configSchema),
   };
 
-  const child = spawn(process.execPath, ["--no-warnings", hostScriptPath, entryPoint], {
+  const child = fork(hostScriptPath, [], {
+    execArgv: ["--no-warnings"],
     env,
-    stdio: ["ignore", "ignore", "ignore", "ipc"],
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+  });
+  let childStderr = "";
+  child.stderr?.on("data", (chunk: Buffer) => {
+    childStderr = (childStderr + chunk.toString("utf8")).slice(-4_000);
   });
 
   // Track pending calls with timeout support
@@ -150,7 +170,13 @@ export async function loadPlugin(
 
   child.on(
     "message",
-    (msg: { type: string; id?: string; hooks?: string[]; result?: unknown; error?: string }) => {
+    (msg: {
+      type: string;
+      id?: string;
+      hooks?: string[];
+      result?: unknown;
+      error?: string;
+    }) => {
       if (msg.type === "ready") {
         log.info("loader.process_ready", { name: manifest.name, hooks: msg.hooks });
       } else if (msg.type === "result" && msg.id) {
@@ -176,7 +202,11 @@ export async function loadPlugin(
     log.info("loader.process_exit", { name: manifest.name, code });
     for (const [, pending] of pendingCalls) {
       clearTimeout(pending.timer);
-      pending.reject(new Error(`Plugin process exited with code ${code}`));
+      pending.reject(
+        new Error(
+          `Plugin process exited with code ${code}${childStderr.trim() ? `: ${childStderr.trim()}` : ""}`
+        )
+      );
     }
     pendingCalls.clear();
     rm(hostScriptPath, { force: true }).catch(() => {});
@@ -259,6 +289,25 @@ export async function loadPlugin(
     };
     registeredHooks.push("onError");
   }
+
+  const imageTimeoutMs = (providerId: string): number =>
+    manifest.imageProviders.find(
+      (provider) => provider.id === providerId || provider.alias === providerId
+    )?.timeoutMs ?? DEFAULT_HOOK_TIMEOUT;
+
+  if (manifest.hooks.onImageGeneration) {
+    plugin.onImageGeneration = async (
+      ctx: PluginImageRequestContext
+    ): Promise<PluginImageResult> =>
+      (await callHook("onImageGeneration", ctx, imageTimeoutMs(ctx.provider))) as PluginImageResult;
+    registeredHooks.push("onImageGeneration");
+  }
+
+  if (manifest.hooks.onImageEdit) {
+    plugin.onImageEdit = async (ctx: PluginImageRequestContext): Promise<PluginImageResult> =>
+      (await callHook("onImageEdit", ctx, imageTimeoutMs(ctx.provider))) as PluginImageResult;
+    registeredHooks.push("onImageEdit");
+  }
   // ── Lifecycle hooks (fire-and-forget, errors logged but don't block) ──
   const lifecycleHooks: Array<{
     key: "onInstall" | "onActivate" | "onDeactivate" | "onUninstall";
@@ -314,7 +363,16 @@ export async function loadPlugin(
  */
 function getFilteredEnv(permissions: Permission[]): Record<string, string> {
   const safeKeys = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "NODE_ENV"];
-  const extendedSafeKeys = [...safeKeys, "PORT", "HOSTNAME", "TZ", "TMPDIR"];
+  const extendedSafeKeys = [
+    ...safeKeys,
+    "PORT",
+    "HOSTNAME",
+    "TZ",
+    "TMPDIR",
+    "OMNIROUTE_PUBLIC_BASE_URL",
+    "OMNIROUTE_BASE_URL",
+    "NEXT_PUBLIC_BASE_URL",
+  ];
   const allowedKeys = permissions.includes("env") ? extendedSafeKeys : safeKeys;
   const env: Record<string, string> = {};
 
