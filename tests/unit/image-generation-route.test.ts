@@ -128,6 +128,28 @@ test("v1 image generation POST accepts promptless requests for image-only models
   assert.equal(body.data[0].b64_json, "BwcH");
 });
 
+test("v1 image generation POST accepts prompt-only requests for multimodal models", async () => {
+  await seedConnection("openai", { apiKey: "multimodal-key" });
+
+  globalThis.fetch = async (url) => {
+    assert.equal(String(url), "https://api.openai.com/v1/images/generations");
+    return new Response(JSON.stringify({ data: [{ b64_json: "AQID" }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  const response = await imageRoute.POST(
+    new Request("http://localhost/api/v1/images/generations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "openai/gpt-image-1.5", prompt: "prompt-only" }),
+    })
+  );
+
+  assert.equal(response.status, 200);
+});
+
 test("v1 image generation POST still requires prompts for text-input models", async () => {
   const response = await imageRoute.POST(
     new Request("http://localhost/api/v1/images/generations", {
@@ -165,6 +187,37 @@ test("v1 image edit POST enforces disabled API key policy", async () => {
 
   assert.equal(response.status, 403);
   assert.match(body.error.message, /disabled/);
+});
+
+test("v1 image generation POST honors API-key allowedConnections", async () => {
+  await seedConnection("openai", { apiKey: "blocked-image-key" });
+  const allowed = await seedConnection("openai", { apiKey: "allowed-image-key" });
+  const restrictedKey = await apiKeysDb.createApiKey("Restricted image key", "machine-image-allowed");
+  await apiKeysDb.updateApiKeyPermissions(restrictedKey.id, {
+    allowedConnections: [(allowed as { id: string }).id],
+  });
+
+  globalThis.fetch = async (_url, options = {}) => {
+    const headers = new Headers(options.headers);
+    assert.equal(headers.get("authorization"), "Bearer allowed-image-key");
+    return new Response(JSON.stringify({ data: [{ b64_json: "AQID" }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  const response = await imageRoute.POST(
+    new Request("http://localhost/api/v1/images/generations", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${restrictedKey.key}`,
+      },
+      body: JSON.stringify({ model: "openai/gpt-image-2", prompt: "allowed account" }),
+    })
+  );
+
+  assert.equal(response.status, 200);
 });
 
 test("v1 image generation POST resolves proxy and executes with proxy context when credentials.connectionId exists", async () => {

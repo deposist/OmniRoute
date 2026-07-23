@@ -151,7 +151,10 @@ async function postHandler(request, context) {
   const imageModelEntry = getImageModelEntry(body.model);
   const inputModalities = imageModelEntry?.inputModalities || ["text"];
   const requiresPrompt = inputModalities.includes("text");
-  const requiresImageInput = inputModalities.includes("image");
+  // inputModalities describes accepted capabilities, not a conjunction. A
+  // multimodal ["text", "image"] model can generate from a prompt alone; only
+  // image-only models require an image input.
+  const requiresImageInput = inputModalities.includes("image") && !requiresPrompt;
   const hasPrompt = typeof body.prompt === "string" && body.prompt.trim().length > 0;
   const hasImageInput = hasImageGenerationInput(body);
 
@@ -169,11 +172,19 @@ async function postHandler(request, context) {
     );
   }
 
+  const allowedConnections =
+    policy.apiKeyInfo?.allowedConnections && policy.apiKeyInfo.allowedConnections.length > 0
+      ? policy.apiKeyInfo.allowedConnections
+      : null;
+
   // Get credentials — skip for local providers (authType: "none")
   let credentials = null;
   if (providerConfig && providerConfig.authType !== "none") {
     credentials = await getProviderCredentialsWithQuotaPreflight(
-      providerConfig.format === "plugin" ? providerConfig.credentialProvider : provider
+      providerConfig.format === "plugin" ? providerConfig.credentialProvider : provider,
+      null,
+      allowedConnections,
+      body.model
     );
     if (!credentials) {
       return errorResponse(
@@ -190,7 +201,12 @@ async function postHandler(request, context) {
       );
     }
   } else if (isCustomModel) {
-    credentials = await getProviderCredentialsWithQuotaPreflight(provider);
+    credentials = await getProviderCredentialsWithQuotaPreflight(
+      provider,
+      null,
+      allowedConnections,
+      body.model
+    );
     if (!credentials) {
       return errorResponse(
         HTTP_STATUS.BAD_REQUEST,
