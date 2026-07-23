@@ -8,7 +8,7 @@
  * @module plugins/loader
  */
 
-import { fork } from "child_process";
+import { spawn } from "child_process";
 import { writeFile, rm, readFile } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -147,11 +147,11 @@ export async function loadPlugin(
     PLUGIN_CONFIG_SCHEMA: JSON.stringify(manifest.configSchema),
   };
 
-  const child = fork(hostScriptPath, [], {
-    execArgv: ["--no-warnings"],
+  const child = spawn(process.execPath, ["--no-warnings", hostScriptPath], {
     env,
     stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
+
   let childStderr = "";
   child.stderr?.on("data", (chunk: Buffer) => {
     childStderr = (childStderr + chunk.toString("utf8")).slice(-4_000);
