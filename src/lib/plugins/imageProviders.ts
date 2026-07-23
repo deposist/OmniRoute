@@ -63,8 +63,22 @@ export interface RegisteredPluginImageProvider extends PluginImageProviderDefini
   edit?: PluginImageHandler;
 }
 
-const providers = new Map<string, RegisteredPluginImageProvider>();
-const aliases = new Map<string, string>();
+interface PluginImageProviderRegistryState {
+  providers: Map<string, RegisteredPluginImageProvider>;
+  aliases: Map<string, string>;
+}
+
+const REGISTRY_STATE_KEY = Symbol.for("omniroute.plugin-image-provider-registry");
+const globalRegistry = globalThis as unknown as Record<PropertyKey, unknown>;
+const registryState =
+  (globalRegistry[REGISTRY_STATE_KEY] as PluginImageProviderRegistryState | undefined) ??
+  {
+    providers: new Map<string, RegisteredPluginImageProvider>(),
+    aliases: new Map<string, string>(),
+  };
+globalRegistry[REGISTRY_STATE_KEY] = registryState;
+
+const { providers, aliases } = registryState;
 
 export function registerPluginImageProvider(provider: RegisteredPluginImageProvider): void {
   const previous = providers.get(provider.id);
