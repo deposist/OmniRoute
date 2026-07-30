@@ -30,6 +30,9 @@ on:
     paths-ignore:
       - "docs/**"
       - "**/*.md"
+      # Excluded from package.json#files, so editing it cannot change the artifact.
+      # Listed by exact path, not bin/**: the other bin/*.sh DO ship in the tarball.
+      - "bin/update-from-fork.sh"
   workflow_dispatch:
     inputs:
       ref:

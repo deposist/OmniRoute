@@ -203,8 +203,9 @@ fetch_ci_tarball() {
 
 resolve_tarball() {
   local src="$1" tmp out dist_entries
-  # Accept an https:// URL so --from-release (and a hand-copied release link) can skip
-  # the download-then-scp dance entirely.
+  # Accept an https:// URL so a hand-copied artifact/asset link can skip the
+  # download-then-scp dance entirely. (--from-ci does the lookup for you; this is the
+  # escape hatch when you already have a URL.)
   case "$src" in
     http://* | https://*)
       ops_require_cmd curl
@@ -222,7 +223,9 @@ resolve_tarball() {
       ops_require_cmd unzip
       tmp="$(mktemp -d)"
       unzip -q -o "$src" -d "$tmp" || ops_die "could not unzip $src"
-      out="$(find "$tmp" -type f -name '*.tgz' | head -1)"
+      # Not `find ... | head -1`: head leaves after the first line, find takes SIGPIPE
+      # and pipefail turns that into a spurious failure. -print -quit stops find itself.
+      out="$(find "$tmp" -type f -name '*.tgz' -print -quit)"
       [ -n "$out" ] || ops_die "no .tgz inside $src (expected the packed tarball from the Build Fork Tarball workflow)"
       ;;
     *.tgz | *.tar.gz) out="$src" ;;
@@ -274,7 +277,15 @@ restart_server() {
 verify() {
   ops_log "installed binary version: $(omniroute --version 2>/dev/null || printf 'unknown')"
   ops_log "plugin registry:"
-  omniroute plugin list 2>&1 | head -20 || ops_log "  (could not list plugins; check 'omniroute status')"
+  # Capture first, then trim. Piping straight into `head -20` lets head exit early,
+  # kill the producer with SIGPIPE and (under pipefail) trip the || branch, which would
+  # print "could not list plugins" over a listing that actually succeeded.
+  local plugin_out
+  if plugin_out="$(omniroute plugin list 2>&1)"; then
+    printf '%s\n' "$plugin_out" | sed -n '1,20p' >&2
+  else
+    ops_log "  (could not list plugins; check 'omniroute status')"
+  fi
 }
 
 if [ "$DO_ROLLBACK" -eq 1 ]; then
@@ -311,18 +322,32 @@ if [ "$FROM_CI" = "1" ]; then
   TARBALL="$(fetch_ci_tarball)"
 fi
 
+# Fail before the download, not after: --from-ci pulls hundreds of MB, and dying
+# afterwards on a missing git dir would waste all of it.
+if [ -z "$TARBALL" ] && ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  ops_die "$REPO_ROOT is not a git clone; source mode needs one. Use --tarball <file|url> or --from-ci."
+fi
+
 RESOLVED_TARBALL=""
 [ -z "$TARBALL" ] || RESOLVED_TARBALL="$(resolve_tarball "$TARBALL")"
 
-TARGET_REF="$(resolve_target_ref)"
-CURRENT_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 CURRENT_VERSION="$(global_version)"
-
 ops_log "repo:           $REPO_ROOT"
 ops_log "data dir:       $OMNIROUTE_DATA_DIR"
-ops_log "target ref:     $TARGET_REF"
-ops_log "current commit: $(git -C "$REPO_ROOT" rev-parse --short HEAD)"
 ops_log "global version: $CURRENT_VERSION"
+
+# In tarball mode the git state is informational only -- nothing is fetched, checked
+# out or built from it -- so a missing//shallow clone must not abort the install.
+TARGET_REF=""
+CURRENT_SHA=""
+if git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  TARGET_REF="$(resolve_target_ref)"
+  CURRENT_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  ops_log "target ref:     $TARGET_REF"
+  ops_log "current commit: $(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+else
+  ops_log "current commit: (not a git clone; tarball mode)"
+fi
 [ -z "$TARBALL" ] || ops_log "tarball:        $RESOLVED_TARBALL"
 
 TARGET_SHA="$CURRENT_SHA"
@@ -351,7 +376,10 @@ else
     ops_log "already at $TARGET_REF; rebuilding anyway"
   else
     ops_log "updating $(git -C "$REPO_ROOT" rev-parse --short "$CURRENT_SHA") -> $(git -C "$REPO_ROOT" rev-parse --short "$TARGET_SHA")"
-    git -C "$REPO_ROOT" --no-pager log --oneline "$CURRENT_SHA..$TARGET_SHA" 2>/dev/null | head -15 >&2 || true
+    # Capture then trim: `git log | head -15` lets head exit early and kill git with
+    # SIGPIPE, which under pipefail trips the `|| true` and silently drops the log.
+    local_log="$(git -C "$REPO_ROOT" --no-pager log --oneline "$CURRENT_SHA..$TARGET_SHA" 2>/dev/null || true)"
+    [ -z "$local_log" ] || printf '%s\n' "$local_log" | sed -n '1,15p' >&2
   fi
 
   [ "$ASSUME_YES" -eq 1 ] || ops_confirm "Build $TARGET_REF and replace the global omniroute install?"
@@ -385,7 +413,7 @@ fi
 # known-good, regardless of where the ref points later.
 mkdir -p "$OMNIROUTE_DATA_DIR"
 {
-  printf 'PREV_SHA=%s\n' "$CURRENT_SHA"
+  printf 'PREV_SHA=%s\n' "${CURRENT_SHA:-unknown}"
   printf 'PREV_VERSION=%s\n' "$CURRENT_VERSION"
   printf 'UPDATED_TO=%s\n' "$TARGET_SHA"
   printf 'UPDATED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
