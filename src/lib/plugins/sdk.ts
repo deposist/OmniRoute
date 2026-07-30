@@ -13,8 +13,14 @@ import type {
   PluginResult,
   BlockingHookResult,
 } from "./hooks.ts";
+import type {
+  PluginImageHandler,
+  PluginImageRequestContext,
+  PluginImageResult,
+} from "./imageProviders.ts";
 
 export type { Plugin, PluginContext, PluginResult, BlockingHookResult };
+export type { PluginImageHandler, PluginImageRequestContext, PluginImageResult };
 
 // ── Plugin Definition Helper ──
 
@@ -31,6 +37,10 @@ export interface PluginDefinition {
   onResponse?: (ctx: PluginContext, response: unknown) => Promise<unknown | void> | unknown | void;
   /** Hook: runs on handler error. Can recover or re-throw. */
   onError?: (ctx: PluginContext, error: Error) => Promise<unknown | void> | unknown | void;
+  /** Handle a normalized /v1/images/generations request for a declared provider. */
+  onImageGeneration?: PluginImageHandler;
+  /** Handle a normalized /v1/images/edits request for a declared provider. */
+  onImageEdit?: PluginImageHandler;
 }
 
 /**
@@ -61,6 +71,8 @@ export function definePlugin(def: PluginDefinition): Plugin {
     onRequest: def.onRequest,
     onResponse: def.onResponse,
     onError: def.onError,
+    onImageGeneration: def.onImageGeneration,
+    onImageEdit: def.onImageEdit,
   };
 }
 

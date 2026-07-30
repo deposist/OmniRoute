@@ -14,9 +14,11 @@ import { rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { randomUUID, createHash } from "crypto";
+import { pathToFileURL } from "url";
 import { logger } from "../../../open-sse/utils/logger.ts";
 import type { PluginManifestWithDefaults, Permission } from "./manifest";
 import type { Plugin, PluginContext, PluginResult } from "./index";
+import type { PluginImageRequestContext, PluginImageResult } from "./imageProviders";
 
 const log = logger("PLUGIN_LOADER");
 
@@ -110,6 +112,18 @@ const require = createRequire(import.meta.url);
 // throw ERR_UNSUPPORTED_ESM_URL_SCHEME ("C:" is parsed as a URL scheme), so no
 // plugin could ever load. file:// URLs work on every platform.
 const pluginPath = process.argv[2];
+
+// configSchema defaults are materialized here rather than in the parent so a plugin
+// always observes every declared key, even when the stored config predates a newly
+// added field. Stored values win over defaults.
+const pluginConfigSchema = JSON.parse(process.env.PLUGIN_CONFIG_SCHEMA || "{}");
+const storedPluginConfig = JSON.parse(process.env.PLUGIN_CONFIG || "{}");
+const pluginConfig = { ...Object.fromEntries(Object.entries(pluginConfigSchema).flatMap(([key, field]) =>
+  field && typeof field === "object" && Object.prototype.hasOwnProperty.call(field, "default")
+    ? [[key, field.default]]
+    : []
+)), ...storedPluginConfig };
+
 const plugin = await import(pathToFileURL(pluginPath).href);
 const exports = plugin.default || plugin;
 
@@ -125,10 +139,13 @@ process.on("message", async (msg) => {
         process.send({ type: "result", id: msg.id, error: "Hook not found" });
         return;
       }
-      const result = await handler(msg.payload);
+      const payload = msg.payload && typeof msg.payload === "object"
+        ? { ...msg.payload, config: pluginConfig }
+        : msg.payload;
+      const result = await handler(payload);
       process.send({ type: "result", id: msg.id, result });
     } catch (err) {
-      process.send({ type: "result", id: msg.id, error: err.message });
+      process.send({ type: "result", id: msg.id, error: err instanceof Error ? err.message : String(err) });
     }
   }
 });
@@ -140,7 +157,8 @@ process.on("message", async (msg) => {
  */
 export async function loadPlugin(
   entryPoint: string,
-  manifest: PluginManifestWithDefaults
+  manifest: PluginManifestWithDefaults,
+  config: Record<string, unknown> = {}
 ): Promise<LoadedPlugin> {
   // Integrity check: if the manifest declares an integrity field, verify the entry point.
   // Missing integrity is OK for backward compatibility; mismatched integrity is a fatal error.
@@ -191,8 +209,10 @@ export async function loadPlugin(
 
   const env: Record<string, string> = {
     ...getFilteredEnv(permissions),
-    PLUGIN_ENTRY: entryPoint,
+    PLUGIN_ENTRY: pathToFileURL(entryPoint).href,
     PLUGIN_NAME: manifest.name,
+    PLUGIN_CONFIG: JSON.stringify(config),
+    PLUGIN_CONFIG_SCHEMA: JSON.stringify(manifest.configSchema),
   };
 
   const child = spawn(process.execPath, ["--no-warnings", hostScriptPath, entryPoint], {
@@ -208,6 +228,14 @@ export async function loadPlugin(
   forwardChildOutput(child.stdout, manifest.name, "info");
   forwardChildOutput(child.stderr, manifest.name, "error");
 
+  // Retain a bounded tail of stderr so an early crash (e.g. a plugin that throws at
+  // import time, before any hook runs) surfaces its real cause in the rejection
+  // message below instead of a bare exit code.
+  let childStderr = "";
+  child.stderr?.on("data", (chunk: Buffer) => {
+    childStderr = (childStderr + chunk.toString("utf8")).slice(-4_000);
+  });
+
   // Track pending calls with timeout support
   const pendingCalls: Map<
     string,
@@ -221,7 +249,13 @@ export async function loadPlugin(
 
   child.on(
     "message",
-    (msg: { type: string; id?: string; hooks?: string[]; result?: unknown; error?: string }) => {
+    (msg: {
+      type: string;
+      id?: string;
+      hooks?: string[];
+      result?: unknown;
+      error?: string;
+    }) => {
       if (msg.type === "ready") {
         log.info("loader.process_ready", { name: manifest.name, hooks: msg.hooks });
       } else if (msg.type === "result" && msg.id) {
@@ -247,7 +281,11 @@ export async function loadPlugin(
     log.info("loader.process_exit", { name: manifest.name, code });
     for (const [, pending] of pendingCalls) {
       clearTimeout(pending.timer);
-      pending.reject(new Error(`Plugin process exited with code ${code}`));
+      pending.reject(
+        new Error(
+          `Plugin process exited with code ${code}${childStderr.trim() ? `: ${childStderr.trim()}` : ""}`
+        )
+      );
     }
     pendingCalls.clear();
     removeHostScript(hostScriptPath);
@@ -330,6 +368,25 @@ export async function loadPlugin(
     };
     registeredHooks.push("onError");
   }
+
+  const imageTimeoutMs = (providerId: string): number =>
+    manifest.imageProviders.find(
+      (provider) => provider.id === providerId || provider.alias === providerId
+    )?.timeoutMs ?? DEFAULT_HOOK_TIMEOUT;
+
+  if (manifest.hooks.onImageGeneration) {
+    plugin.onImageGeneration = async (
+      ctx: PluginImageRequestContext
+    ): Promise<PluginImageResult> =>
+      (await callHook("onImageGeneration", ctx, imageTimeoutMs(ctx.provider))) as PluginImageResult;
+    registeredHooks.push("onImageGeneration");
+  }
+
+  if (manifest.hooks.onImageEdit) {
+    plugin.onImageEdit = async (ctx: PluginImageRequestContext): Promise<PluginImageResult> =>
+      (await callHook("onImageEdit", ctx, imageTimeoutMs(ctx.provider))) as PluginImageResult;
+    registeredHooks.push("onImageEdit");
+  }
   // ── Lifecycle hooks (fire-and-forget, errors logged but don't block) ──
   const lifecycleHooks: Array<{
     key: "onInstall" | "onActivate" | "onDeactivate" | "onUninstall";
@@ -391,7 +448,19 @@ function getFilteredEnv(permissions: Permission[]): Record<string, string> {
   // plugins silently stop applying. They carry no secrets.
   const platformKeys = process.platform === "win32" ? ["SystemRoot", "windir"] : [];
   const safeKeys = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "NODE_ENV", ...platformKeys];
-  const extendedSafeKeys = [...safeKeys, "PORT", "HOSTNAME", "TZ", "TMPDIR"];
+  // The base-URL keys let an image-provider plugin build absolute URLs back to this
+  // instance (e.g. for returned image links) without hardcoding a host. They are
+  // public deployment addresses, not secrets.
+  const extendedSafeKeys = [
+    ...safeKeys,
+    "PORT",
+    "HOSTNAME",
+    "TZ",
+    "TMPDIR",
+    "OMNIROUTE_PUBLIC_BASE_URL",
+    "OMNIROUTE_BASE_URL",
+    "NEXT_PUBLIC_BASE_URL",
+  ];
   const allowedKeys = permissions.includes("env") ? extendedSafeKeys : safeKeys;
   const env: Record<string, string> = {};
 

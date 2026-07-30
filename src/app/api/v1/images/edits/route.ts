@@ -2,6 +2,7 @@ import {
   handleAdobeFireflyImageGeneration,
   handleCodexImageEdit,
   handleImageEdit,
+  handlePluginImageEdit,
   handleOpenAIImageEdit,
 } from "@omniroute/open-sse/handlers/imageGeneration.ts";
 import { createInjectionGuard } from "@/middleware/promptInjectionGuard";
@@ -34,6 +35,7 @@ import {
 } from "@/shared/middleware/bodySizeGuard";
 import { getCachedSettings } from "@/lib/db/readCache";
 import { z } from "zod";
+import { proxyConfigToUrl } from "@omniroute/open-sse/utils/proxyDispatcher.ts";
 
 // JSON edit body (Open WebUI / OpenAI-style). All fields optional — the prompt
 // and resolvable image are enforced after extraction in POST — but the top-level
@@ -99,6 +101,9 @@ interface EditInput {
   imageMime: string | null;
   images: Array<{ bytes: Buffer; mime: string }>;
   imageInputCount: number;
+  // Bounded (max 4) view of `images` for plugin image providers, whose ABI treats
+  // mime as optional. See imageRouteModel.ts for the same split.
+  imageInputs: Array<{ bytes: Buffer; mime?: string }>;
 }
 
 const MAX_NON_CODEX_IMAGE_EDIT_REFERENCES = 1;
@@ -136,6 +141,9 @@ async function readMultipartImage(formData: FormData): Promise<EditInput> {
     imageMime: firstImage?.mime ?? null,
     images,
     imageInputCount: imageEntries.length,
+    // Plugin providers accept at most 4 references; `images` keeps the full set so
+    // the cardinality checks below still see every submitted candidate.
+    imageInputs: images.slice(0, 4),
   };
 }
 
@@ -315,8 +323,17 @@ async function postHandler(request: Request, _context?: unknown) {
     );
   }
 
-  const { prompt, model, size, responseFormat, imageBytes, imageMime, images, imageInputCount } =
-    input;
+  const {
+    prompt,
+    model,
+    size,
+    responseFormat,
+    imageBytes,
+    imageMime,
+    images,
+    imageInputCount,
+    imageInputs,
+  } = input;
   if (!prompt) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: prompt");
   }
@@ -357,23 +374,68 @@ async function postHandler(request: Request, _context?: unknown) {
   const parsed = parseImageModel(resolvedModel);
   const providerConfig = parsed.provider ? getImageProvider(parsed.provider) : null;
   // Firefly nano/gpt-image accept multiple reference blobs; other non-Codex stay at 1.
+  // Plugin providers carry their own 4-reference ABI bound, so they are excluded here
+  // and validated by the plugin branch below.
   const maxRefsForProvider =
     providerConfig?.format === "adobe-firefly-image"
       ? 4
-      : providerConfig?.format === "codex-responses"
-        ? Number.POSITIVE_INFINITY
-        : MAX_NON_CODEX_IMAGE_EDIT_REFERENCES;
-  if (
-    providerConfig?.format !== "codex-responses" &&
-    imageInputCount > maxRefsForProvider
-  ) {
+      : providerConfig?.format === "plugin"
+        ? 4
+        : providerConfig?.format === "codex-responses"
+          ? Number.POSITIVE_INFINITY
+          : MAX_NON_CODEX_IMAGE_EDIT_REFERENCES;
+  if (providerConfig?.format !== "codex-responses" && imageInputCount > maxRefsForProvider) {
     return errorResponse(
       HTTP_STATUS.BAD_REQUEST,
-      providerConfig?.format === "adobe-firefly-image"
-        ? "Adobe Firefly image edit supports at most 4 reference images"
+      providerConfig?.format === "adobe-firefly-image" || providerConfig?.format === "plugin"
+        ? "This image edit provider supports at most 4 reference images"
         : "This image edit provider currently supports only one reference image"
     );
   }
+
+  if (providerConfig?.format === "plugin") {
+    const credentials = await getProviderCredentialsWithQuotaPreflight(
+      providerConfig.credentialProvider,
+      null,
+      allowedConnections,
+      resolvedModel
+    );
+    if (!credentials) {
+      return errorResponse(
+        HTTP_STATUS.UNAUTHORIZED,
+        `No credentials for provider: ${providerConfig.credentialProvider}`
+      );
+    }
+    if (credentials.allRateLimited) {
+      return unavailableResponse(
+        HTTP_STATUS.RATE_LIMITED,
+        `[${parsed.provider}] All accounts rate limited`,
+        credentials.retryAfter,
+        credentials.retryAfterHuman
+      );
+    }
+    const proxyInfo = credentials.connectionId
+      ? await resolveProxyForConnection(credentials.connectionId).catch(() => null)
+      : null;
+    const result = await handlePluginImageEdit({
+      provider: parsed.provider,
+      model: parsed.model,
+      body: { prompt, size: size ?? undefined },
+      imageInputs,
+      credentials,
+      clientHeaders: publicBaseUrlHeaders(request.headers),
+      proxyUrl: proxyConfigToUrl(proxyInfo?.proxy || null),
+    });
+    if (result.success) {
+      await clearRecoveredProviderState(credentials);
+      return jsonResponse(result.data);
+    }
+    return jsonResponse(
+      toJsonErrorPayload(result.error, "Image edit provider error"),
+      result.status
+    );
+  }
+
   // chatgpt-web keeps its conversation-continuation edit flow unchanged.
   if (providerConfig?.format === "chatgpt-web") {
     const credentials = await getProviderCredentialsWithQuotaPreflight(

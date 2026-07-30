@@ -8,6 +8,7 @@
  */
 
 import { logger } from "../../../open-sse/utils/logger.ts";
+import type { PluginImageHandler } from "./imageProviders.ts";
 
 const log = logger("PLUGIN_HOOKS");
 
@@ -253,6 +254,8 @@ export interface Plugin {
   onRequest?: (ctx: PluginContext) => Promise<PluginResult | void> | PluginResult | void;
   onResponse?: (ctx: PluginContext, response: unknown) => Promise<unknown | void> | unknown | void;
   onError?: (ctx: PluginContext, error: Error) => Promise<unknown | void> | unknown | void;
+  onImageGeneration?: PluginImageHandler;
+  onImageEdit?: PluginImageHandler;
   // ── Lifecycle hooks (fire-and-forget, non-blocking) ──
   onInstall?: (payload: unknown) => Promise<void> | void;
   onActivate?: (payload: unknown) => Promise<void> | void;

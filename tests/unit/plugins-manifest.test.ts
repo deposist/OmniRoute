@@ -95,6 +95,50 @@ describe("applyDefaults", () => {
     assert.equal(result.main, "handler.js");
     assert.equal(result.enabledByDefault, true);
   });
+
+  it("accepts and defaults an external image provider", () => {
+    const parsed = mod.PluginManifestSchema.parse({
+      name: "image-plugin",
+      version: "1.0.0",
+      hooks: { onImageGeneration: true, onImageEdit: true },
+      imageProviders: [
+        {
+          id: "chatgpt-web-plugin",
+          alias: "cgpt-web-plugin",
+          credentialProvider: "chatgpt-web",
+          models: [{ id: "gpt-image", name: "GPT Image" }],
+          operations: ["generation", "edit"],
+        },
+      ],
+    });
+    const result = mod.applyDefaults(parsed);
+
+    assert.equal(result.hooks.onImageGeneration, true);
+    assert.equal(result.hooks.onImageEdit, true);
+    assert.equal(result.imageProviders[0].timeoutMs, 180_000);
+    assert.deepEqual(result.imageProviders[0].models[0].inputModalities, ["text"]);
+  });
+
+  it("rejects image operations without their declared handlers", () => {
+    const result = mod.PluginManifestSchema.safeParse({
+      name: "broken-image-plugin",
+      version: "1.0.0",
+      hooks: { onImageGeneration: true },
+      imageProviders: [
+        {
+          id: "broken-images",
+          credentialProvider: "chatgpt-web",
+          models: [{ id: "model", name: "Model" }],
+          operations: ["generation", "edit"],
+        },
+      ],
+    });
+
+    assert.equal(result.success, false);
+    if (!result.success) {
+      assert.match(result.error.message, /onImageEdit/);
+    }
+  });
 });
 
 describe("PermissionSchema", () => {

@@ -16,6 +16,7 @@ import { buildSyncedCapabilities, mergeSyncedCapabilities } from "./syncedCapabi
 import { getAllEmbeddingModels } from "@omniroute/open-sse/config/embeddingRegistry";
 import {
   getAllImageModels,
+  getImageProvider,
   isRegisteredImageModel,
 } from "@omniroute/open-sse/config/imageRegistry";
 import { getAllRerankModels } from "@omniroute/open-sse/config/rerankRegistry";
@@ -1041,9 +1042,11 @@ async function buildUnifiedModelsResponseCore(
 
     // Add image models (filtered by active providers)
     for (const imgModel of getAllImageModels()) {
-      if (!isProviderActive(imgModel.provider)) continue;
+      const credentialProvider = getImageProvider(imgModel.provider)?.credentialProvider;
+      const routingProvider = credentialProvider || imgModel.provider;
+      if (!isProviderActive(routingProvider)) continue;
       const rawModelId = imgModel.id.split("/").pop() || imgModel.id;
-      if (!providerSupportsModel(imgModel.provider, rawModelId)) continue;
+      if (!providerSupportsModel(routingProvider, rawModelId)) continue;
       if (getModelIsHidden(imgModel.provider, rawModelId)) continue;
       models.push({
         id: imgModel.id,

@@ -543,6 +543,16 @@ export async function registerNodejs(): Promise<void> {
           console.warn("[STARTUP] Arena ELO sync failed to start (non-fatal):", msg);
         }),
 
+      // Load active plugins in the production instrumentation path so image-provider
+      // registrations survive service restarts. The legacy server-init.ts path is not used
+      // by the standalone runtime. Keep failures non-fatal, matching other startup services.
+      import("@/lib/plugins/manager")
+        .then((m) => m.pluginManager.loadAll())
+        .catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn("[STARTUP] Plugin manager loadAll failed (non-fatal):", msg);
+        }),
+
       // Pricing sync: opt-in external pricing data (self-gated by PRICING_SYNC_ENABLED inside
       // initPricingSync). Non-blocking, never fatal.
       import("@/lib/pricingSync")

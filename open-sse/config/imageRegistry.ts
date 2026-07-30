@@ -11,6 +11,11 @@ import { KIE_IMAGE_MODELS } from "./providers/registry/kie/imageModels.ts";
 import { FREEPIK_IMAGE_PROVIDER } from "./providers/registry/freepik/index.ts";
 import { STABILITY_AI_IMAGE_MODELS } from "./providers/registry/stability-ai/imageModels.ts";
 import { GEMINI_IMAGEN_PROVIDER } from "./providers/registry/gemini/imageModels.ts";
+import {
+  getAllPluginImageModels,
+  getPluginImageProvider,
+  parsePluginImageModel,
+} from "@/lib/plugins/imageProviders";
 
 interface ImageModelEntry {
   id: string;
@@ -25,6 +30,7 @@ interface ImageModelEntry {
 
 interface ImageProviderConfig {
   id: string;
+  credentialProvider?: string;
   baseUrl: string;
   fallbackUrl?: string;
   proUrl?: string;
@@ -831,7 +837,21 @@ export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
  * Get image provider config by ID
  */
 export function getImageProvider(providerId) {
-  return IMAGE_PROVIDERS[providerId] || null;
+  const builtIn = IMAGE_PROVIDERS[providerId];
+  if (builtIn) return builtIn;
+  const plugin = getPluginImageProvider(providerId);
+  if (!plugin) return null;
+  return {
+    id: plugin.id,
+    alias: plugin.alias,
+    credentialProvider: plugin.credentialProvider,
+    baseUrl: `plugin://${plugin.pluginName}`,
+    authType: "apikey",
+    authHeader: "cookie",
+    format: "plugin",
+    models: plugin.models,
+    supportedSizes: plugin.supportedSizes,
+  };
 }
 
 /**
@@ -840,6 +860,11 @@ export function getImageProvider(providerId) {
  */
 export function parseImageModel(modelStr) {
   if (!modelStr) return { provider: null, model: null };
+
+  const pluginModel = parsePluginImageModel(modelStr);
+  if (pluginModel) {
+    return { provider: pluginModel.provider.id, model: pluginModel.model.id };
+  }
 
   const directAlias = resolveImageModelAlias(modelStr);
   if (directAlias) {
@@ -916,7 +941,7 @@ export function getAllImageModels(): ImageCatalogModelEntry[] {
     const entry = imageAliasCatalogEntry(alias, target);
     return entry ? [entry] : [];
   });
-  return [...providerModels, ...aliasModels];
+  return [...providerModels, ...aliasModels, ...getAllPluginImageModels()];
 }
 
 export function getImageModelAliases() {
@@ -933,7 +958,10 @@ export function getImageModelAliases() {
  * out of the chat listing when they are already known image-only models.
  */
 export function isRegisteredImageModel(providerId, modelId) {
-  return Boolean(findImageModelConfig(providerId, modelId));
+  const plugin = getPluginImageProvider(providerId);
+  return Boolean(
+    findImageModelConfig(providerId, modelId) || plugin?.models.some((model) => model.id === modelId)
+  );
 }
 
 export function getImageModelEntry(modelStr) {
@@ -954,7 +982,9 @@ export function getImageModelEntry(modelStr) {
   const { provider, model } = parseImageModel(modelStr);
   if (!provider || !model) return null;
 
-  const modelConfig = findImageModelConfig(provider, model);
+  const modelConfig =
+    findImageModelConfig(provider, model) ||
+    getPluginImageProvider(provider)?.models.find((entry) => entry.id === model);
   if (!modelConfig) return null;
 
   return {

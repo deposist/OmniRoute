@@ -1,0 +1,65 @@
+{
+  "name": "chatgpt-web-images",
+  "version": "1.0.0",
+  "description": "ChatGPT Web cookie image generation and editing provider for OmniRoute",
+  "author": "local",
+  "license": "MIT",
+  "main": "index.mjs",
+  "source": "local",
+  "tags": ["images", "chatgpt-web"],
+  "requires": {
+    "omniroute": "=3.8.48",
+    "permissions": ["network"]
+  },
+  "hooks": {
+    "onImageGeneration": true,
+    "onImageEdit": true
+  },
+  "imageProviders": [
+    {
+      "id": "chatgpt-web-images",
+      "alias": "cgpt-web-plugin",
+      "credentialProvider": "chatgpt-web",
+      "models": [
+        {
+          "id": "gpt-5.5",
+          "name": "GPT Image via ChatGPT Web",
+          "inputModalities": ["text", "image"],
+          "description": "Image generation and 1-4 image editing through a ChatGPT Web session cookie"
+        }
+      ],
+      "supportedSizes": ["1024x1024", "1536x1024", "1024x1536"],
+      "operations": ["generation", "edit"],
+      "timeoutMs": 1200000
+    }
+  ],
+  "enabledByDefault": true,
+  "configSchema": {
+    "proxyUrl": {
+      "type": "string",
+      "description": "Optional HTTP/SOCKS proxy URL used by tls-client-node for chatgpt.com"
+    },
+    "imageTimeoutMs": {
+      "type": "number",
+      "default": 150000,
+      "min": 1000,
+      "max": 1200000,
+      "description": "Total polling budget for deferred image generation"
+    },
+    "imageWsTimeoutMs": {
+      "type": "number",
+      "default": 30000,
+      "min": 1000,
+      "max": 300000,
+      "description": "WebSocket wait before falling back to polling"
+    },
+    "proTimeoutMs": {
+      "type": "number",
+      "default": 1200000,
+      "min": 1000,
+      "max": 1800000,
+      "description": "Long-running ChatGPT handoff timeout"
+    }
+  },
+  "integrity": "sha256-1cXNpqUAtK8m7rb53zyU7RYGg2cB00zrVgW1KwRQvig="
+}

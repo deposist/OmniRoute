@@ -106,6 +106,10 @@ interface ParsedImageEditInput {
   imageMime: string | null;
   images: Array<{ bytes: Buffer; mime: string }>;
   imageInputCount: number;
+  // Bounded (max 4) view of `images` handed to plugin image providers, whose ABI
+  // treats mime as optional. Kept alongside `images` rather than replacing it so
+  // the Codex path keeps its full, strictly-typed reference set.
+  imageInputs: Array<{ bytes: Buffer; mime?: string }>;
 }
 
 export const MAX_CODEX_IMAGE_EDIT_BYTES = 20 * 1024 * 1024;
@@ -241,5 +245,8 @@ export function extractImageEditInputFromJson(body: unknown): ParsedImageEditInp
     imageMime: firstImage?.mime ?? null,
     images: parsedImages,
     imageInputCount: candidates.length,
+    // Plugin providers accept at most 4 references; slice here so the plugin ABI
+    // never sees more than it can forward while `images` keeps the full set.
+    imageInputs: parsedImages.slice(0, 4),
   };
 }
