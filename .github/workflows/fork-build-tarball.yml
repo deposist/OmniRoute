@@ -1,0 +1,128 @@
+name: Build Fork Tarball
+
+# Builds an installable npm tarball of THIS fork on a CI runner and attaches it as
+# a workflow artifact.
+#
+# Why this exists: the target server has 960 MB of RAM, and `npm run build:release`
+# needs ~2.5 GB of heap for the Next build (below that it is OOM-killed silently,
+# right after "Creating an optimized production build"). Building here on
+# ubuntu-latest and shipping the resulting tarball keeps the server out of the
+# build path entirely: package.json#files already ships dist/, and the only install
+# hook is postinstall (native binary fixups), which does not rebuild Next.
+#
+# Trigger is workflow_dispatch ONLY, deliberately:
+#   * A v* tag would make lock-released-branch fail every future sync push to
+#     release/v3.8.49 (it fails when a tag matching the branch version exists).
+#   * A v* tag would also start docker-publish.yml and electron-release.yml, which
+#     have no repository guard and would fail on secrets this fork lacks
+#     (DOCKERHUB_USERNAME / DOCKERHUB_TOKEN / NPM_TOKEN).
+# Nothing here publishes to a registry; npm publish is impossible anyway because
+# the `omniroute` package name belongs to upstream.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch, tag or SHA)"
+        required: false
+        default: "release/v3.8.49"
+        type: string
+      retention_days:
+        description: "How long to keep the artifact (days)"
+        required: false
+        default: "30"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORK_BUILD_NODE_VERSION: "24"
+
+jobs:
+  build-tarball:
+    name: Build installable tarball
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+          # build:release embeds `git rev-parse --short HEAD`, so it needs real history.
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.FORK_BUILD_NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build release artifacts
+        run: npm run build:release
+
+      - name: Pack tarball
+        id: pack
+        run: |
+          set -euo pipefail
+          # `npm pack` runs prepack (absent here) but NOT prepublishOnly, so this packs
+          # exactly the dist/ produced by the build step above.
+          FILE="$(npm pack --silent | tail -1)"
+          test -s "$FILE" || { echo "npm pack produced no file" >&2; exit 1; }
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p 'require("./package.json").version')" >> "$GITHUB_OUTPUT"
+
+      - name: Validate tarball contents
+        env:
+          FILE: ${{ steps.pack.outputs.file }}
+        run: |
+          set -euo pipefail
+          # The repo's own gate: catches a tarball missing dist/ or shipping files the
+          # pack policy forbids.
+          npm run check:pack-artifact
+
+          # dist/ is what makes this tarball installable without a build, so fail loudly
+          # rather than shipping something the server cannot use.
+          if ! tar -tzf "$FILE" | grep -q '^package/dist/'; then
+            echo "::error::$FILE contains no dist/ — the server would have to build it itself."
+            exit 1
+          fi
+          echo "Entries: $(tar -tzf "$FILE" | wc -l), size: $(du -h "$FILE" | cut -f1)"
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: omniroute-fork-tarball-${{ steps.pack.outputs.version }}
+          path: ${{ steps.pack.outputs.file }}
+          retention-days: ${{ inputs.retention_days }}
+          if-no-files-found: error
+
+      - name: Summary
+        env:
+          FILE: ${{ steps.pack.outputs.file }}
+          VERSION: ${{ steps.pack.outputs.version }}
+          BUILT_REF: ${{ inputs.ref }}
+        run: |
+          {
+            echo "## Fork tarball ready"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`$VERSION\` |"
+            echo "| Ref | \`$BUILT_REF\` |"
+            echo "| Commit | \`$(git rev-parse --short HEAD)\` |"
+            echo "| File | \`$FILE\` |"
+            echo
+            echo "Download the artifact, copy it to the server, then run:"
+            echo
+            echo '```bash'
+            echo "./bin/update-from-fork.sh --tarball ~/$FILE"
+            echo '```'
+            echo
+            echo "That installs the prebuilt tarball without running the Next build, so it"
+            echo "works on low-memory hosts. Roll back with \`--rollback\`."
+          } >> "$GITHUB_STEP_SUMMARY"

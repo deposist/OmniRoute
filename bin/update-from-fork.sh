@@ -8,6 +8,12 @@
 # instead builds the fork checkout and installs that build globally, so the
 # running binary always matches the fork.
 #
+# Low-memory hosts: the Next build needs ~2.5 GB of heap and is OOM-killed
+# silently below that, so a small server cannot build at all. Use --tarball with
+# an artifact from .github/workflows/fork-build-tarball.yml to install a prebuilt
+# package instead; package.json#files ships dist/, and the only install hook is
+# postinstall (native binary fixups), so no Next build happens on the server.
+#
 # Data safety: the install itself never rewrites the SQLite store under
 # $DATA_DIR, but a consistent snapshot is taken first (bin/snapshot-data.sh) so a
 # bad build can be rolled back. Snapshots are interchangeable with the ones the
@@ -27,6 +33,9 @@ Builds this fork checkout and installs it as the global `omniroute` binary.
 Options:
   --ref <git-ref>     Ref to update to (default: the current branch's upstream,
                       else the current branch). Example: release/v3.8.49
+  --tarball <path>    Install a prebuilt .tgz instead of building from source.
+                      Accepts the GitHub artifact .zip directly (the .tgz is
+                      extracted from it). Use this on hosts with <4 GB RAM.
   --no-fetch          Skip `git fetch`; build the working tree as-is.
   --skip-snapshot     Do not snapshot $DATA_DIR before installing.
   --skip-restart      Install only; do not stop/start the server.
@@ -39,6 +48,9 @@ Env: DATA_DIR (default ~/.omniroute), PORT (passed to `omniroute restart`).
 
 Notes:
   * Run as the user that owns the global npm prefix and $DATA_DIR.
+  * --tarball skips git fetch/checkout and the build; the running commit of this
+    checkout is irrelevant to what gets installed. Installed tarballs are kept in
+    $DATA_DIR/tarballs so --rollback can reinstall the previous one.
   * Node must satisfy package.json engines (>=22.22.2 <23 || >=24 <27).
   * Do NOT use `omniroute update --apply` on a fork: it installs upstream from
     npm and drops fork-local features.
@@ -46,6 +58,7 @@ EOF
 }
 
 REF=""
+TARBALL=""
 DO_FETCH=1
 DO_SNAPSHOT=1
 DO_RESTART=1
@@ -55,6 +68,7 @@ DO_ROLLBACK=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --ref) REF="${2:?--ref needs a value}"; shift 2 ;;
+    --tarball) TARBALL="${2:?--tarball needs a value}"; shift 2 ;;
     --no-fetch) DO_FETCH=0; shift ;;
     --skip-snapshot) DO_SNAPSHOT=0; shift ;;
     --skip-restart) DO_RESTART=0; shift ;;
@@ -114,6 +128,36 @@ global_version() {
   printf '%s' "${out:-none}"
 }
 
+# GitHub hands out workflow artifacts as .zip, so accept that shape too instead of
+# making the operator unzip by hand. Logs go to stderr (ops_log), keeping stdout
+# clean for the resolved path used by command substitution.
+resolve_tarball() {
+  local src="$1" tmp out
+  [ -f "$src" ] || ops_die "tarball not found: $src"
+  case "$src" in
+    *.zip)
+      ops_require_cmd unzip
+      tmp="$(mktemp -d)"
+      unzip -q -o "$src" -d "$tmp" || ops_die "could not unzip $src"
+      out="$(find "$tmp" -type f -name '*.tgz' | head -1)"
+      [ -n "$out" ] || ops_die "no .tgz inside $src (expected the packed tarball from the Build Fork Tarball workflow)"
+      ;;
+    *.tgz | *.tar.gz) out="$src" ;;
+    *) ops_die "expected a .tgz or the GitHub artifact .zip, got: $src" ;;
+  esac
+  # A tarball without dist/ would make npm try to build on this host, which is the
+  # exact failure --tarball exists to avoid, so reject it before touching the install.
+  tar -tzf "$out" | grep -q '^package/dist/' ||
+    ops_die "$src ships no dist/; it would require a local build. Rebuild it with the Build Fork Tarball workflow."
+  printf '%s' "$out"
+}
+
+install_tarball() {
+  local tgz="$1"
+  ops_log "installing prebuilt tarball globally (npm install -g)"
+  npm install -g "$tgz"
+}
+
 # Build before the global install: the build is the slow, failure-prone step, and
 # aborting there leaves the currently installed binary untouched.
 build_and_install() {
@@ -153,9 +197,18 @@ if [ "$DO_ROLLBACK" -eq 1 ]; then
   ops_log "rolling back to $PREV_SHA (previous global version: ${PREV_VERSION:-unknown})"
   [ "$ASSUME_YES" -eq 1 ] || ops_confirm "Rebuild and reinstall commit $PREV_SHA?"
   assert_node_supported
-  git -C "$REPO_ROOT" checkout --quiet --detach "$PREV_SHA"
   omniroute stop >/dev/null 2>&1 || true
-  build_and_install
+  # Rebuilding is impossible on a low-memory host, so reuse the archived tarball
+  # when the previous install came from one.
+  if [ -n "${PREV_TARBALL:-}" ] && [ -f "${PREV_TARBALL:-}" ]; then
+    ops_log "reinstalling archived tarball: $PREV_TARBALL"
+    install_tarball "$PREV_TARBALL"
+  else
+    [ -z "${PREV_TARBALL:-}" ] ||
+      ops_log "WARNING: archived tarball $PREV_TARBALL is gone; falling back to a source rebuild"
+    git -C "$REPO_ROOT" checkout --quiet --detach "$PREV_SHA"
+    build_and_install
+  fi
   restart_server || true
   verify
   ops_log "rollback complete. Data was not modified by the install itself;"
@@ -164,6 +217,9 @@ if [ "$DO_ROLLBACK" -eq 1 ]; then
 fi
 
 assert_node_supported
+
+RESOLVED_TARBALL=""
+[ -z "$TARBALL" ] || RESOLVED_TARBALL="$(resolve_tarball "$TARBALL")"
 
 TARGET_REF="$(resolve_target_ref)"
 CURRENT_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
@@ -174,30 +230,39 @@ ops_log "data dir:       $OMNIROUTE_DATA_DIR"
 ops_log "target ref:     $TARGET_REF"
 ops_log "current commit: $(git -C "$REPO_ROOT" rev-parse --short HEAD)"
 ops_log "global version: $CURRENT_VERSION"
+[ -z "$TARBALL" ] || ops_log "tarball:        $RESOLVED_TARBALL"
 
-# Uncommitted fork-local edits would either be baked into the build silently or
-# be destroyed by the checkout below, so refuse to guess.
-if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
-  ops_die "working tree is dirty. Commit or stash changes first (git -C $REPO_ROOT status)."
-fi
-
-if [ "$DO_FETCH" -eq 1 ]; then
-  ops_log "fetching refs"
-  git -C "$REPO_ROOT" fetch --prune --tags origin
-fi
-
-git -C "$REPO_ROOT" rev-parse --verify --quiet "${TARGET_REF}^{commit}" >/dev/null ||
-  ops_die "ref not found: $TARGET_REF"
-TARGET_SHA="$(git -C "$REPO_ROOT" rev-parse "${TARGET_REF}^{commit}")"
-
-if [ "$TARGET_SHA" = "$CURRENT_SHA" ]; then
-  ops_log "already at $TARGET_REF; rebuilding anyway"
+TARGET_SHA="$CURRENT_SHA"
+if [ -n "$TARBALL" ]; then
+  # No build and no checkout happen, so a dirty tree and stale refs cannot affect
+  # the result: the tarball alone determines what gets installed.
+  ops_log "tarball mode: skipping fetch, checkout and build"
+  [ "$ASSUME_YES" -eq 1 ] || ops_confirm "Install $RESOLVED_TARBALL as the global omniroute?"
 else
-  ops_log "updating $(git -C "$REPO_ROOT" rev-parse --short "$CURRENT_SHA") -> $(git -C "$REPO_ROOT" rev-parse --short "$TARGET_SHA")"
-  git -C "$REPO_ROOT" --no-pager log --oneline "$CURRENT_SHA..$TARGET_SHA" 2>/dev/null | head -15 >&2 || true
-fi
+  # Uncommitted fork-local edits would either be baked into the build silently or
+  # be destroyed by the checkout below, so refuse to guess.
+  if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
+    ops_die "working tree is dirty. Commit or stash changes first (git -C $REPO_ROOT status)."
+  fi
 
-[ "$ASSUME_YES" -eq 1 ] || ops_confirm "Build $TARGET_REF and replace the global omniroute install?"
+  if [ "$DO_FETCH" -eq 1 ]; then
+    ops_log "fetching refs"
+    git -C "$REPO_ROOT" fetch --prune --tags origin
+  fi
+
+  git -C "$REPO_ROOT" rev-parse --verify --quiet "${TARGET_REF}^{commit}" >/dev/null ||
+    ops_die "ref not found: $TARGET_REF"
+  TARGET_SHA="$(git -C "$REPO_ROOT" rev-parse "${TARGET_REF}^{commit}")"
+
+  if [ "$TARGET_SHA" = "$CURRENT_SHA" ]; then
+    ops_log "already at $TARGET_REF; rebuilding anyway"
+  else
+    ops_log "updating $(git -C "$REPO_ROOT" rev-parse --short "$CURRENT_SHA") -> $(git -C "$REPO_ROOT" rev-parse --short "$TARGET_SHA")"
+    git -C "$REPO_ROOT" --no-pager log --oneline "$CURRENT_SHA..$TARGET_SHA" 2>/dev/null | head -15 >&2 || true
+  fi
+
+  [ "$ASSUME_YES" -eq 1 ] || ops_confirm "Build $TARGET_REF and replace the global omniroute install?"
+fi
 
 SNAPSHOT_ID=""
 if [ "$DO_SNAPSHOT" -eq 1 ]; then
@@ -208,6 +273,21 @@ else
   ops_log "skipping snapshot (--skip-snapshot)"
 fi
 
+# Read before the state file is overwritten: the tarball installed last time is the
+# one --rollback needs to reinstall.
+PRIOR_TARBALL=""
+[ ! -f "$STATE_FILE" ] || PRIOR_TARBALL="$(sed -n 's/^INSTALLED_TARBALL=//p' "$STATE_FILE" | tail -1)"
+
+# Keep the tarball around: on a host that cannot build, an archived copy is the only
+# way back to the previous version.
+ARCHIVED_TARBALL=""
+if [ -n "$TARBALL" ]; then
+  mkdir -p "$OMNIROUTE_DATA_DIR/tarballs"
+  ARCHIVED_TARBALL="$OMNIROUTE_DATA_DIR/tarballs/$(date -u +%Y%m%dT%H%M%SZ)-$(basename "$RESOLVED_TARBALL")"
+  cp "$RESOLVED_TARBALL" "$ARCHIVED_TARBALL"
+  ops_log "archived tarball: $ARCHIVED_TARBALL"
+fi
+
 # Recorded before the checkout so --rollback targets the exact commit that was
 # known-good, regardless of where the ref points later.
 mkdir -p "$OMNIROUTE_DATA_DIR"
@@ -216,17 +296,27 @@ mkdir -p "$OMNIROUTE_DATA_DIR"
   printf 'PREV_VERSION=%s\n' "$CURRENT_VERSION"
   printf 'UPDATED_TO=%s\n' "$TARGET_SHA"
   printf 'UPDATED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  [ -n "$PRIOR_TARBALL" ] && printf 'PREV_TARBALL=%s\n' "$PRIOR_TARBALL"
+  [ -n "$ARCHIVED_TARBALL" ] && printf 'INSTALLED_TARBALL=%s\n' "$ARCHIVED_TARBALL"
   [ -n "$SNAPSHOT_ID" ] && printf 'SNAPSHOT_ID=%s\n' "$SNAPSHOT_ID"
 } >"$STATE_FILE"
 
 ops_log "stopping server"
 omniroute stop >/dev/null 2>&1 || ops_log "  (server was not running)"
 
-git -C "$REPO_ROOT" checkout --quiet --detach "$TARGET_SHA"
+if [ -n "$TARBALL" ]; then
+  install_tarball "$ARCHIVED_TARBALL"
+else
+  git -C "$REPO_ROOT" checkout --quiet --detach "$TARGET_SHA"
+  build_and_install
+fi
 
-build_and_install
 restart_server || true
 verify
 
-ops_log "update complete: $(git -C "$REPO_ROOT" rev-parse --short "$TARGET_SHA")"
+if [ -n "$TARBALL" ]; then
+  ops_log "update complete from tarball: $(basename "$RESOLVED_TARBALL")"
+else
+  ops_log "update complete: $(git -C "$REPO_ROOT" rev-parse --short "$TARGET_SHA")"
+fi
 ops_log "rollback with: bin/update-from-fork.sh --rollback"
