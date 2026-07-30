@@ -62,8 +62,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Turbopack (the default bundler) is NOT usable here: its native Rust
+      # allocation is not bounded by --max-old-space-size and peaks far higher than
+      # webpack on this module graph (#6409), so the build was OOM-killed on
+      # ubuntu-latest with the runner-reclaimed signature ("The operation was
+      # canceled", no exit code) at the "Creating an optimized production build"
+      # phase — the same failure nightly-compat.yml already documents for #8090.
+      # Upstream builds with Turbopack on a self-hosted runner (quality.yml uses
+      # omni-release); this fork has only the hosted runner, so use the documented
+      # webpack fallback, which peaks much lower and produces the same dist/.
+      # See docs/reference/ENVIRONMENT.md (OMNIROUTE_USE_TURBOPACK).
       - name: Build release artifacts
         run: npm run build:release
+        env:
+          OMNIROUTE_USE_TURBOPACK: "0"
 
       - name: Pack tarball
         id: pack
