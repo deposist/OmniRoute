@@ -185,6 +185,14 @@ const IGNORE_FROM_CODE = new Set([
   // Test-only override: points setup-open-code.mjs at a fixture plugin dir without
   // requiring the real bundled plugin to be built.
   "OMNIROUTE_OPENCODE_PLUGIN_DIR",
+  // Parent→child IPC channel for external image-provider plugins: the plugin host
+  // (src/lib/plugins/loader.ts) injects the resolved config and its manifest schema
+  // into the spawned plugin process, which reads them back via process.env. They are
+  // set by OmniRoute per spawn, never by an operator, so there is nothing for
+  // .env.example or ENVIRONMENT.md to document — same as the sibling PLUGIN_ENTRY /
+  // PLUGIN_NAME vars injected alongside them.
+  "PLUGIN_CONFIG",
+  "PLUGIN_CONFIG_SCHEMA",
 ]);
 
 // Vars documented in ENVIRONMENT.md but intentionally absent from .env.example.

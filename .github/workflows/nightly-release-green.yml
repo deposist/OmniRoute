@@ -187,6 +187,16 @@ jobs:
             echo "_Ratchet drift (eslint warnings / cognitive-complexity / file-size) listed above is expected mid-cycle and is rebaselined at release — it is NOT a contributor concern and did not, on its own, open this issue._"
           } > issue-body.md
 
+          # Forks routinely have Issues disabled (and a fork token may lack issues:write).
+          # Without this probe `gh issue create` exits 1 and becomes the ONLY thing that
+          # fails this job, masking the real hard failures behind "repository has disabled
+          # issues". Fall back to the job summary so the verdict stays visible.
+          if ! gh issue list --repo "$GITHUB_REPOSITORY" --limit 1 >/dev/null 2>&1; then
+            echo "Issues unavailable on $GITHUB_REPOSITORY — writing the verdict to the job summary instead."
+            cat issue-body.md >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+            exit 0
+          fi
+
           EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --search "in:title $TITLE" --json number --jq '.[0].number' 2>/dev/null || echo "")
           if [ -n "$EXISTING" ]; then
@@ -205,6 +215,14 @@ jobs:
             release-green.json
             release-green.log
           if-no-files-found: ignore
+
+      - name: Fail if the release branch is not green
+        if: steps.validate.outputs.exit != '0'
+        env:
+          TARGET: ${{ steps.branch.outputs.target }}
+        run: |
+          echo "::error::release-green found HARD failures on ${TARGET} — see the report above and the release-green-report artifact."
+          exit 1
 
   # Companion arm for `main`. Under the parallel-cycle model, main only receives merged
   # work at the release squash — so a gate/infra fix that lands only on release leaves
@@ -284,6 +302,16 @@ jobs:
             echo ""
             echo "_Ratchet drift (eslint warnings / cognitive-complexity / file-size) is expected mid-cycle and did NOT, on its own, open this issue._"
           } > issue-body.md
+
+          # Forks routinely have Issues disabled (and a fork token may lack issues:write).
+          # Without this probe `gh issue create` exits 1 and becomes the ONLY thing that
+          # fails this job, masking the real hard failures behind "repository has disabled
+          # issues". Fall back to the job summary so the verdict stays visible.
+          if ! gh issue list --repo "$GITHUB_REPOSITORY" --limit 1 >/dev/null 2>&1; then
+            echo "Issues unavailable on $GITHUB_REPOSITORY — writing the verdict to the job summary instead."
+            cat issue-body.md >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+            exit 0
+          fi
 
           EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --search "in:title $TITLE" --json number --jq '.[0].number' 2>/dev/null || echo "")
