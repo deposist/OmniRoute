@@ -36,6 +36,11 @@ Options:
   --tarball <path>    Install a prebuilt .tgz instead of building from source.
                       Accepts the GitHub artifact .zip directly (the .tgz is
                       extracted from it). Use this on hosts with <4 GB RAM.
+  --from-ci           Download the newest successful Build Fork Tarball artifact
+                      from GitHub Actions and install that, no browser or scp.
+                      Needs a token with Actions:read in $GH_TOKEN, or in
+                      ~/.config/omniroute/gh-token (chmod 600). Artifacts expire
+                      after the workflow's retention window.
   --no-fetch          Skip `git fetch`; build the working tree as-is.
   --skip-snapshot     Do not snapshot $DATA_DIR before installing.
   --skip-restart      Install only; do not stop/start the server.
@@ -59,6 +64,7 @@ EOF
 
 REF=""
 TARBALL=""
+FROM_CI=0
 DO_FETCH=1
 DO_SNAPSHOT=1
 DO_RESTART=1
@@ -69,6 +75,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --ref) REF="${2:?--ref needs a value}"; shift 2 ;;
     --tarball) TARBALL="${2:?--tarball needs a value}"; shift 2 ;;
+    --from-ci) FROM_CI=1; shift ;;
     --no-fetch) DO_FETCH=0; shift ;;
     --skip-snapshot) DO_SNAPSHOT=0; shift ;;
     --skip-restart) DO_RESTART=0; shift ;;
@@ -131,8 +138,84 @@ global_version() {
 # GitHub hands out workflow artifacts as .zip, so accept that shape too instead of
 # making the operator unzip by hand. Logs go to stderr (ops_log), keeping stdout
 # clean for the resolved path used by command substitution.
+# --from-ci: pull the newest successful Build Fork Tarball artifact straight onto
+# this host. Deliberately pull-based: deploy-vps.yml already tried the push
+# direction (runner -> SSH into the VPS) and is permanently SKIPped because the
+# host firewalls :22 away from GitHub runners, so the server has to fetch instead.
+#
+# Artifact download always needs auth, even on a public repo (GitHub API rule), so
+# a token with Actions:read is required. Read it from the environment or a 0600
+# file, never from a CLI flag, so it cannot leak into shell history or `ps`.
+GH_TOKEN_FILE_DEFAULT="${XDG_CONFIG_HOME:-$HOME/.config}/omniroute/gh-token"
+FORK_REPO_DEFAULT="deposist/OmniRoute"
+FORK_WORKFLOW_FILE="fork-build-tarball.yml"
+
+# Prints the token or nothing. It must NOT ops_die: this runs inside a command
+# substitution, where a die would only kill the subshell and let the caller carry
+# on with an empty token -- which surfaced as a confusing Node/API error instead of
+# "no token". The caller checks for empty and reports.
+ci_token() {
+  local file="${OMNIROUTE_GH_TOKEN_FILE:-$GH_TOKEN_FILE_DEFAULT}"
+  if [ -n "${GH_TOKEN:-}" ]; then printf '%s' "$GH_TOKEN"; return 0; fi
+  if [ -n "${GITHUB_TOKEN:-}" ]; then printf '%s' "$GITHUB_TOKEN"; return 0; fi
+  [ -f "$file" ] || return 0
+  tr -d '[:space:]' <"$file"
+}
+
+fetch_ci_tarball() {
+  local repo="${OMNIROUTE_FORK_REPO:-$FORK_REPO_DEFAULT}" token api run_id name url tmp out
+  ops_require_cmd curl
+  ops_require_cmd node
+  token="$(ci_token)"
+  [ -n "$token" ] ||
+    ops_die "no GitHub token. Put one with Actions:read on ${repo} in \$GH_TOKEN, or in ${OMNIROUTE_GH_TOKEN_FILE:-$GH_TOKEN_FILE_DEFAULT} (chmod 600)."
+  api="https://api.github.com/repos/${repo}"
+
+  ops_log "looking up the newest successful ${FORK_WORKFLOW_FILE} run on ${repo}"
+  run_id="$(curl -fsSL -H "Authorization: Bearer ${token}" \
+    -H "Accept: application/vnd.github+json" \
+    "${api}/actions/workflows/${FORK_WORKFLOW_FILE}/runs?status=success&per_page=1" |
+    node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const r=JSON.parse(s).workflow_runs;process.stdout.write(r&&r[0]?String(r[0].id):"");}catch{process.stdout.write("");}})')" ||
+    ops_die "GitHub API call failed (bad or expired token?)"
+  [ -n "$run_id" ] ||
+    ops_die "no successful ${FORK_WORKFLOW_FILE} run found. Push to the release branch or start it from the Actions tab, then retry."
+
+  # Read name and URL together so a run whose artifact already expired is reported
+  # as such instead of failing later on an empty URL.
+  local meta
+  meta="$(curl -fsSL -H "Authorization: Bearer ${token}" \
+    -H "Accept: application/vnd.github+json" \
+    "${api}/actions/runs/${run_id}/artifacts" |
+    node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const a=(JSON.parse(s).artifacts||[]).filter(x=>!x.expired);process.stdout.write(a[0]?a[0].name+"\t"+a[0].archive_download_url:"");}catch{process.stdout.write("");}})')" ||
+    ops_die "could not list artifacts of run ${run_id}"
+  name="${meta%%$'\t'*}"
+  url="${meta#*$'\t'}"
+  [ -n "$name" ] && [ -n "$url" ] ||
+    ops_die "run ${run_id} has no unexpired artifact left (retention window passed). Re-run the workflow."
+
+  tmp="$(mktemp -d)"
+  out="$tmp/${name}.zip"
+  ops_log "downloading artifact ${name} from run ${run_id}"
+  curl -fsSL --retry 3 --retry-delay 2 -H "Authorization: Bearer ${token}" \
+    -o "$out" "$url" || ops_die "artifact download failed"
+  printf '%s' "$out"
+}
+
 resolve_tarball() {
-  local src="$1" tmp out
+  local src="$1" tmp out dist_entries
+  # Accept an https:// URL so --from-release (and a hand-copied release link) can skip
+  # the download-then-scp dance entirely.
+  case "$src" in
+    http://* | https://*)
+      ops_require_cmd curl
+      tmp="$(mktemp -d)"
+      out="$tmp/$(basename "${src%%\?*}")"
+      ops_log "downloading $src"
+      curl -fsSL --retry 3 --retry-delay 2 -o "$out" "$src" ||
+        ops_die "download failed: $src"
+      src="$out"
+      ;;
+  esac
   [ -f "$src" ] || ops_die "tarball not found: $src"
   case "$src" in
     *.zip)
@@ -147,7 +230,12 @@ resolve_tarball() {
   esac
   # A tarball without dist/ would make npm try to build on this host, which is the
   # exact failure --tarball exists to avoid, so reject it before touching the install.
-  tar -tzf "$out" | grep -q '^package/dist/' ||
+  # Count over the whole listing instead of `| grep -q`: grep -q exits on its first
+  # match, tar then dies of SIGPIPE (141), and `set -o pipefail` would turn that into a
+  # false "ships no dist/" rejection of a perfectly good tarball. grep -c reads to EOF,
+  # and `|| true` absorbs its exit 1 on zero matches.
+  dist_entries="$(tar -tzf "$out" | grep -c '^package/dist/' || true)"
+  [ "${dist_entries:-0}" -gt 0 ] ||
     ops_die "$src ships no dist/; it would require a local build. Rebuild it with the Build Fork Tarball workflow."
   printf '%s' "$out"
 }
@@ -217,6 +305,11 @@ if [ "$DO_ROLLBACK" -eq 1 ]; then
 fi
 
 assert_node_supported
+
+if [ "$FROM_CI" = "1" ]; then
+  [ -z "$TARBALL" ] || ops_die "--from-ci and --tarball are mutually exclusive"
+  TARBALL="$(fetch_ci_tarball)"
+fi
 
 RESOLVED_TARBALL=""
 [ -z "$TARBALL" ] || RESOLVED_TARBALL="$(resolve_tarball "$TARBALL")"

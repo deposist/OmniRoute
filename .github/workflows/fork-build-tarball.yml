@@ -10,7 +10,8 @@ name: Build Fork Tarball
 # build path entirely: package.json#files already ships dist/, and the only install
 # hook is postinstall (native binary fixups), which does not rebuild Next.
 #
-# Trigger is workflow_dispatch ONLY, deliberately:
+# Triggers are push (on the fork's release branch) and workflow_dispatch. What this
+# deliberately does NOT do is create a tag or a GitHub Release:
 #   * A v* tag would make lock-released-branch fail every future sync push to
 #     release/v3.8.49 (it fails when a tag matching the branch version exists).
 #   * A v* tag would also start docker-publish.yml and electron-release.yml, which
@@ -20,6 +21,15 @@ name: Build Fork Tarball
 # the `omniroute` package name belongs to upstream.
 
 on:
+  # Auto-build on every push to the fork's release branch so a fresh tarball exists
+  # without anyone remembering to press "Run workflow". Still no tag and no release is
+  # created, so the upstream release plumbing stays untouched (see the note above).
+  push:
+    branches:
+      - "release/v3.8.49"
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   workflow_dispatch:
     inputs:
       ref:
@@ -48,7 +58,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
           # build:release embeds `git rev-parse --short HEAD`, so it needs real history.
           fetch-depth: 0
@@ -57,20 +67,27 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: ${{ env.FORK_BUILD_NODE_VERSION }}
-          cache: npm
+          # No `cache: npm` on purpose. This job now runs on push and its output is
+          # installed straight onto a production host, which is exactly the shape
+          # zizmor's cache-poisoning audit warns about: a poisoned npm cache entry
+          # would land inside the tarball. `npm ci` from the registry costs ~1 min
+          # more and keeps the artifact trustworthy.
 
       - name: Install dependencies
         run: npm ci
 
-      # Turbopack (the default bundler) is NOT usable here: its native Rust
-      # allocation is not bounded by --max-old-space-size and peaks far higher than
-      # webpack on this module graph (#6409), so the build was OOM-killed on
-      # ubuntu-latest with the runner-reclaimed signature ("The operation was
-      # canceled", no exit code) at the "Creating an optimized production build"
-      # phase — the same failure nightly-compat.yml already documents for #8090.
-      # Upstream builds with Turbopack on a self-hosted runner (quality.yml uses
-      # omni-release); this fork has only the hosted runner, so use the documented
-      # webpack fallback, which peaks much lower and produces the same dist/.
+      # Build with webpack rather than the default Turbopack. The first run here died
+      # at "Creating an optimized production build" with "The operation was canceled"
+      # and no exit code (the runner-reclaimed signature); webpack then completed the
+      # same build in ~9 min. Turbopack's native Rust allocation is not bounded by
+      # --max-old-space-size (#6409), and nightly-compat.yml documents the same
+      # fallback for #8090.
+      #
+      # Not a blanket claim that Turbopack cannot work on a hosted runner: this fork's
+      # own image-plugin-artifact.yml builds 3.8.48 with OMNIROUTE_USE_TURBOPACK=1 on
+      # ubuntu-latest. It runs plain `npm run build` though, while this job runs
+      # `build:release` on the larger 3.8.49 graph. Webpack is the conservative choice
+      # for an unattended job; flip this to "1" if you want to retest Turbopack.
       # See docs/reference/ENVIRONMENT.md (OMNIROUTE_USE_TURBOPACK).
       - name: Build release artifacts
         run: npm run build:release
@@ -99,25 +116,32 @@ jobs:
 
           # dist/ is what makes this tarball installable without a build, so fail loudly
           # rather than shipping something the server cannot use.
-          if ! tar -tzf "$FILE" | grep -q '^package/dist/'; then
-            echo "::error::$FILE contains no dist/ — the server would have to build it itself."
+          #
+          # List once into a file. `tar -tzf ... | grep -q` makes grep exit on its first
+          # match, tar then dies of SIGPIPE (exit 141), and `set -o pipefail` promotes
+          # that to a pipeline failure -- a false "no dist/" verdict on every tarball big
+          # enough that tar is still writing when grep leaves. That is exactly how this
+          # step failed run 30517881188 while dist/ was present.
+          tar -tzf "$FILE" > entries.txt
+          if ! grep -q '^package/dist/' entries.txt; then
+            echo "::error::$FILE contains no dist/ - the server would have to build it itself."
             exit 1
           fi
-          echo "Entries: $(tar -tzf "$FILE" | wc -l), size: $(du -h "$FILE" | cut -f1)"
+          echo "Entries: $(wc -l < entries.txt), of them dist/: $(grep -c '^package/dist/' entries.txt), size: $(du -h "$FILE" | cut -f1)"
 
       - name: Upload tarball
         uses: actions/upload-artifact@v7
         with:
           name: omniroute-fork-tarball-${{ steps.pack.outputs.version }}
           path: ${{ steps.pack.outputs.file }}
-          retention-days: ${{ inputs.retention_days }}
+          retention-days: ${{ inputs.retention_days || '30' }}
           if-no-files-found: error
 
       - name: Summary
         env:
           FILE: ${{ steps.pack.outputs.file }}
           VERSION: ${{ steps.pack.outputs.version }}
-          BUILT_REF: ${{ inputs.ref }}
+          BUILT_REF: ${{ inputs.ref || github.ref }}
         run: |
           {
             echo "## Fork tarball ready"
